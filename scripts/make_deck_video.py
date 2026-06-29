@@ -14,8 +14,8 @@ assert slides, "no slides found in outputs/deck/"
 
 # Optional real episode clips to append (unsupervised fail → supervised recover)
 clips = [c for c in [
-    "outputs/episodes/008_unsupervised.mp4",
-    "outputs/episodes/008_supervised.mp4",
+    "outputs/episodes/classical_unsupervised.mp4",
+    "outputs/episodes/classical_supervised.mp4",
 ] if __import__("os").path.exists(c)]
 
 writer = imageio.get_writer(OUT, fps=FPS, codec="libx264", quality=8,
