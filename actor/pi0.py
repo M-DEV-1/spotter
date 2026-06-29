@@ -33,14 +33,13 @@ torch._dynamo.config.disable = True
 DEFAULT_MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
 DEFAULT_INSTRUCTION = "pick up the green cube and place it on the red target"
 
-# Set True if the model outputs 6D Cartesian EE deltas + 1D gripper.
-# Set False (default) if the model outputs 7 joint positions + 1 gripper.
-# Verify with print(policy.config.output_shapes) on spark.
-USE_CARTESIAN_ACTIONS = False
+# pi0_libero uses OSC control: 6D EE Cartesian deltas + 1D gripper = 7D action.
+# State is 8D joint positions [q1..q7, gripper].
+USE_CARTESIAN_ACTIONS = True
 
-# Step size for Jacobian-based Cartesian-to-joint conversion.
-# Only used when USE_CARTESIAN_ACTIONS = True.
-_ALPHA = 0.1
+# Scale factor applied to the Jacobian-converted joint delta.
+# LIBERO OSC actions are unnormalized EE deltas in meters/radians; tune if motion is too fast/slow.
+_ALPHA = 0.05
 
 # Damped least-squares regularisation — matches simulator/ik.py
 _LAMBDA_SQ = 1e-4
@@ -63,6 +62,10 @@ class Pi0Actor:
         self._mj_model = model
         self._mj_data = data
         self._policy = self._load_policy(model_id)
+        self._tokenizer = self._load_tokenizer()
+        self._state_mean, self._state_std, self._action_mean, self._action_std = (
+            self._load_norm_stats(model_id)
+        )
         self._instruction = DEFAULT_INSTRUCTION
         self._step = 0
 
@@ -119,7 +122,9 @@ class Pi0Actor:
         state = np.asarray(obs.get("state", np.zeros(8, dtype=np.float32)), dtype=np.float32)
         image = np.asarray(obs.get("image", np.zeros((480, 640, 3), dtype=np.uint8)), dtype=np.uint8)
 
-        state_t = torch.tensor(state).unsqueeze(0).to(device)          # (1, 8)
+        # Normalize state with MEAN_STD stats from training dataset.
+        state_norm = (state - self._state_mean) / (self._state_std + 1e-8)
+        state_t = torch.tensor(state_norm, dtype=torch.float32).unsqueeze(0).to(device)
 
         # (H, W, 3) uint8 → (1, 3, H, W) float32 in [0, 1]
         img_t = (
@@ -134,37 +139,45 @@ class Pi0Actor:
         img_256 = F.interpolate(img_t, size=(256, 256), mode="bilinear", align_corners=False)
         img_224 = F.interpolate(img_t, size=(224, 224), mode="bilinear", align_corners=False)
 
-        # Keys confirmed from PI0Policy.config.input_features on spark:
-        #   observation.images.image  (3,256,256)
-        #   observation.images.image2 (3,256,256)
-        #   observation.images.empty_camera_0 (3,224,224) — filled with zeros
+        # Tokenize instruction (pi0_new_line_processor appends "\n").
+        task_text = self._instruction + "\n"
+        tokenized = self._tokenizer(
+            [task_text],
+            max_length=48,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+
         obs_dict = {
             "observation.state": state_t,
             "observation.images.image": img_256,
             "observation.images.image2": img_256,
             "observation.images.empty_camera_0": torch.zeros_like(img_224),
-            "task": [self._instruction],
+            "observation.language.tokens": tokenized["input_ids"].to(device),
+            "observation.language.attention_mask": tokenized["attention_mask"].to(
+                dtype=torch.bool, device=device
+            ),
         }
 
         with torch.no_grad():
-            # select_action(obs_dict) → (1, action_dim) tensor
-            # API confirmed from lerobot source — verify on spark if this errors.
             action = self._policy.select_action(obs_dict)
 
-        action_np = action.squeeze(0).cpu().numpy()   # (action_dim,)
+        action_norm = action.squeeze(0).cpu().numpy()  # (7,) normalized
+
+        # Unnormalize: real_action = norm * std + mean
+        action_real = action_norm * self._action_std + self._action_mean  # (7,)
 
         if USE_CARTESIAN_ACTIONS:
-            # action_np[:6] = [Δx, Δy, Δz, ΔRx, ΔRy, ΔRz]
-            # action_np[6]  = gripper delta/command
-            ctrl = self._cartesian_delta_to_ctrl(action_np[:6], state)
-            ctrl[7] = float(np.clip(action_np[6], 0.0, 0.04))
+            # action_real[:6] = [Δx, Δy, Δz, ΔRx, ΔRy, ΔRz] in EE frame
+            # action_real[6]  > 0 → open gripper, < 0 → close
+            ctrl = self._cartesian_delta_to_ctrl(action_real[:6], state)
+            ctrl[7] = 0.04 if action_real[6] > 0 else 0.0
         else:
-            # action_np[:7] = absolute joint positions
-            # action_np[7]  = gripper width (0 = closed, 0.04 = open)
+            # Fallback: treat 7D output as joint positions (likely wrong for pi0_libero).
             ctrl = np.zeros(8, dtype=np.float64)
-            ctrl[:7] = np.clip(action_np[:7].astype(np.float64), -3.15, 3.15)
-            gripper_raw = action_np[7] if len(action_np) > 7 else 0.04
-            ctrl[7] = float(np.clip(gripper_raw, 0.0, 0.04))
+            ctrl[:7] = np.clip(action_real[:7].astype(np.float64), -3.15, 3.15)
+            ctrl[7] = 0.04
 
         self._step += 1
         return ctrl
@@ -180,6 +193,31 @@ class Pi0Actor:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _load_tokenizer(self):
+        from transformers import AutoTokenizer  # noqa: PLC0415
+        return AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+
+    def _load_norm_stats(self, model_id: str):
+        from safetensors.torch import load_file as sf_load  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+        norm_path = Path(model_id) / "policy_preprocessor_step_5_normalizer_processor.safetensors"
+        post_path = Path(model_id) / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
+        if norm_path.exists():
+            norm = sf_load(str(norm_path))
+            state_mean = norm["observation.state.mean"].float().numpy()
+            state_std  = norm["observation.state.std"].float().numpy()
+        else:
+            state_mean = np.zeros(8, dtype=np.float32)
+            state_std  = np.ones(8, dtype=np.float32)
+        if post_path.exists():
+            post = sf_load(str(post_path))
+            action_mean = post["action.mean"].float().numpy()
+            action_std  = post["action.std"].float().numpy()
+        else:
+            action_mean = np.zeros(7, dtype=np.float32)
+            action_std  = np.ones(7, dtype=np.float32)
+        return state_mean, state_std, action_mean, action_std
 
     def _load_policy(self, model_id: str):
         """Load pi0 policy from lerobot hub.  Raises ImportError with a helpful
