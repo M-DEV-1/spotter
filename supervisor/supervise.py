@@ -46,10 +46,14 @@ def run_supervised_episode(
     viser_scene = None
     if watch:
         try:
-            import viser, mjviser
+            import time, viser, mjviser
             _srv = viser.ViserServer(port=watch_port)
             viser_scene = mjviser.ViserMujocoScene(_srv, model, num_envs=1)
-            print(f"  live view → http://spark-3100:{watch_port}")
+            print(f"\n  open browser → http://spark-3100:{watch_port}")
+            for i in range(8, 0, -1):
+                print(f"  starting in {i}s ...  ", end="\r", flush=True)
+                time.sleep(1)
+            print("  starting now!          \n")
         except Exception as e:
             print(f"  watch unavailable: {e}")
 
