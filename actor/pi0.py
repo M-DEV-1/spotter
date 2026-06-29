@@ -41,6 +41,12 @@ USE_CARTESIAN_ACTIONS = True
 # LIBERO OSC actions are unnormalized EE deltas in meters/radians; tune if motion is too fast/slow.
 _ALPHA = 0.05
 
+# Pi0 was trained at ~20Hz control. The sim physics runs much faster, so we
+# hold each computed ctrl for _DECIMATION physics steps before recomputing.
+# This is the #1 cause of jitter: without it the arm gets a fresh target every
+# physics step and never settles. Tune down if motion is sluggish, up if jittery.
+_DECIMATION = 20
+
 # Damped least-squares regularisation — matches simulator/ik.py
 _LAMBDA_SQ = 1e-4
 
@@ -68,6 +74,7 @@ class Pi0Actor:
         )
         self._instruction = DEFAULT_INSTRUCTION
         self._step = 0
+        self._cached_ctrl = None   # held between decimated recomputes
 
 
     # ------------------------------------------------------------------
@@ -78,6 +85,7 @@ class Pi0Actor:
         """Reset policy state and restore default instruction."""
         self._instruction = DEFAULT_INSTRUCTION
         self._step = 0
+        self._cached_ctrl = None
         # Pi0 is diffusion-based; each select_action call is nominally
         # stateless, but reset() clears any internal step counters.
         if hasattr(self._policy, "reset"):
@@ -94,7 +102,14 @@ class Pi0Actor:
         """
         if params is not None and hasattr(params, "corrected_instruction"):
             self.set_instruction(params.corrected_instruction)
-        self._step = 0
+        # Open gripper before recomputing: a closed-gripper starting state
+        # causes the diffusion policy to stay in "grip" mode rather than re-approach.
+        if self._cached_ctrl is not None:
+            self._cached_ctrl = self._cached_ctrl.copy()
+            self._cached_ctrl[7] = 0.04   # open
+        # Step=1 means next act() returns cached (gripper open) for _DECIMATION-1
+        # more physics steps, then step 20 triggers a fresh inference.
+        self._step = 1
         if hasattr(self._policy, "reset"):
             self._policy.reset()
 
@@ -116,6 +131,12 @@ class Pi0Actor:
 
         if obs is None:
             obs = {}
+
+        # Decimation: hold the previous ctrl between recomputes so Pi0's ~20Hz
+        # actions aren't applied at full physics rate (the main jitter cause).
+        if self._cached_ctrl is not None and (self._step % _DECIMATION) != 0:
+            self._step += 1
+            return self._cached_ctrl
 
         device = next(self._policy.parameters()).device
 
@@ -179,7 +200,11 @@ class Pi0Actor:
             ctrl[:7] = np.clip(action_real[:7].astype(np.float64), -3.15, 3.15)
             ctrl[7] = 0.04
 
+        self._cached_ctrl = ctrl
         self._step += 1
+        if self._step % (_DECIMATION * 10) == 0:  # every ~10 recomputes
+            print(f"    [pi0] step={self._step} action_raw[6]={action_norm[6]:.3f} "
+                  f"action_real[6]={action_real[6]:.3f} -> g={ctrl[7]:.3f}")
         return ctrl
 
     def done(self) -> bool:

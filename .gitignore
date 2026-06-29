@@ -20,8 +20,12 @@ videos/
 *.png
 *.jpg
 
-# docs (ignored for now)
-*.md
+# docs (except README)
+PLAN.md
+CLAUDE.md
+TODO.md
+context.md
+progress.md
 
 # editor / OS
 .DS_Store

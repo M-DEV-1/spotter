@@ -88,10 +88,11 @@ with make_renderer(model) as renderer:
         # periodic ctrl printout
         if step % args.print_ctrl_every == 0:
             cpos = get_cube_pos(model, data)
-            ee_z = data.xpos[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripper")][2]
+            sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripper")
+            ee_z = data.site_xpos[sid][2] if sid >= 0 else float("nan")
             signals = compute_signals(model, data)
             print(
-                f"  step {step:4d} | ctrl={np.round(ctrl[:7],3).tolist()} g={ctrl[7]:.3f} "
+                f"  step {step:4d} | ctrl[:7]={np.round(ctrl[:7],2).tolist()} g={ctrl[7]:.3f} "
                 f"| cube=({cpos[0]:.3f},{cpos[1]:.3f},{cpos[2]:.3f}) ee_z={ee_z:.3f} "
                 f"| closed_empty={int(signals['gripper_closed_empty'])} "
                 f"out_region={int(signals['cube_out_of_region'])}"
