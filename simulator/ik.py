@@ -50,7 +50,7 @@ def solve_ik(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     target_pos: np.ndarray,
-    site_name: str = "panda/hand",
+    site_name: str = "gripper",
     max_iters: int = 150,
     tol: float = 5e-3,
     step_size: float = 0.4,
@@ -109,7 +109,7 @@ def solve_approach_grasp(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     cube_pos: np.ndarray,
-    site_name: str = "panda/hand",
+    site_name: str = "gripper",
     above_offset: float = 0.14,
     grasp_offset: float = 0.02,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
