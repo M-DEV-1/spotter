@@ -1,6 +1,10 @@
 """
 Classical keyframe-sequencing actor for Franka Panda pick-and-place.
 Ctrl vectors are hand-tuned via scripts/tune_poses.py (mjviser web viewer).
+
+Two retry paths:
+  retry(params)                 — Gemma-direction path (j1/depth offset from parse_correction)
+  retry_to_position(above, low) — IK path (exact joint targets from simulator/ik.py)
 """
 import numpy as np
 
@@ -37,8 +41,10 @@ class ClassicalActor:
         self._phase = 0
         self._phase_step = 0
         self._prev = HOME.copy()
-        self._j1_offset = 0.0    # joint1 correction — set by retry() from Gemma
-        self._depth_offset = 0.0 # joint2 correction in lower phase — set by retry()
+        self._j1_offset = 0.0     # direction path: from Gemma via parse_correction
+        self._depth_offset = 0.0  # direction path: from Gemma via parse_correction
+        self._ik_above = None     # IK path: exact joint targets from simulator/ik.py
+        self._ik_lower = None     # IK path: exact joint targets from simulator/ik.py
 
     def act(self, obs=None) -> np.ndarray:
         if self._phase >= len(SEQUENCE):
@@ -74,12 +80,62 @@ class ClassicalActor:
         Causal chain: Gemma text → parse_correction() → RetryParams → here.
         No sim state is read."""
         if params is not None:
-            # SET each retry (fresh Gemma observation, not accumulate)
             self._j1_offset = float(params.j1_offset)
             self._depth_offset = float(params.depth_offset)
+        self._ik_above = None
+        self._ik_lower = None
         self._phase = 0
         self._phase_step = 0
-        # _prev stays as current ctrl for smooth transition back
+
+    def retry_to_position(
+        self,
+        above_joints: np.ndarray,
+        lower_joints: np.ndarray,
+    ) -> None:
+        """IK path: restart with exact joint targets computed by simulator/ik.py.
+        Gemma triggers this (causally necessary); sim state provides WHERE via IK.
+        above_joints and lower_joints replace ABOVE_CUBE and LOWER in the sequence."""
+        self._ik_above = above_joints.copy()
+        self._ik_lower = lower_joints.copy()
+        self._j1_offset = 0.0
+        self._depth_offset = 0.0
+        self._phase = 0
+        self._phase_step = 0
+
+    def act(self, obs=None) -> np.ndarray:
+        if self._phase >= len(SEQUENCE):
+            return HOME.copy()
+
+        target_raw, duration, name = SEQUENCE[self._phase]
+
+        # IK path: use solved joint targets for approach and lower phases
+        if self._ik_above is not None and name == "approach":
+            target = np.concatenate([self._ik_above, [0.04]])  # gripper open
+        elif self._ik_lower is not None and name in ("lower", "grasp"):
+            gripper = 0.04 if name == "lower" else 0.00
+            target = np.concatenate([self._ik_lower, [gripper]])
+        # Direction-offset path
+        elif name in _GRASP_PHASES and (self._j1_offset != 0.0 or self._depth_offset != 0.0):
+            target = target_raw.copy()
+            target[0] += self._j1_offset
+            if name == "lower":
+                target[1] = np.clip(target[1] + self._depth_offset, 0.6, 1.1)
+        else:
+            target = target_raw
+
+        t = self._phase_step / max(duration, 1)
+        ctrl = _lerp(self._prev, target, t)
+
+        self._phase_step += 1
+        if self._phase_step >= duration:
+            self._prev = target.copy()
+            self._phase += 1
+            self._phase_step = 0
+
+        return ctrl
+
+    def done(self) -> bool:
+        return self._phase >= len(SEQUENCE)
 
     @property
     def phase_name(self) -> str:

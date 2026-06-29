@@ -23,7 +23,7 @@ from actor.classical import ClassicalActor
 from supervisor.supervise import run_supervised_episode
 
 NUDGE_STEP = 200
-NUDGE_Y    = 0.04  # 4cm
+NUDGE_Y    = 0.10  # 10cm — clearly visible from the NW camera angle
 
 
 def nudge(model, data, step):
