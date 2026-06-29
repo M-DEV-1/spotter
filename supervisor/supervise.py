@@ -12,8 +12,9 @@ from dotenv import load_dotenv
 
 from simulator.scene import load_model, make_data, reset_to_keyframe
 from simulator.record import make_renderer, render_frame, save_mp4
-from supervisor.signals import compute_signals, NoProgressTracker, cube_pos
+from supervisor.signals import compute_signals, NoProgressTracker
 from supervisor.cerebras_client import call_supervisor
+from supervisor.parse_correction import parse_correction
 from tasks.pick_place import init_task
 
 load_dotenv()
@@ -96,7 +97,13 @@ def run_supervised_episode(
                     entry = {
                         "step": step,
                         "signals": {k: bool(v) for k, v in signals.items()},
-                        "correction": vars(correction),
+                        "correction": {
+                            "failure_type": correction.failure_type,
+                            "diagnosis": correction.diagnosis,
+                            "corrected_instruction": correction.corrected_instruction,
+                            "cube_direction": correction.cube_direction,
+                            "approach_depth": correction.approach_depth,
+                        },
                     }
                     log.append(entry)
                     print(f"\n  [supervisor @{step}] {correction.failure_type}")
@@ -105,9 +112,11 @@ def run_supervised_episode(
 
                     if correction.failure_type != "none":
                         retries += 1
-                        cpos = cube_pos(model, data)
-                        print(f"  [retry {retries}] cube at ({cpos[0]:.3f}, {cpos[1]:.3f}) → adjusting joint1")
-                        actor.retry(cube_pos=cpos)
+                        params = parse_correction(correction)
+                        print(f"  [retry {retries}] cube_direction={correction.cube_direction}"
+                              f"  approach_depth={correction.approach_depth}"
+                              f"  → j1_offset={params.j1_offset:+.3f} depth_offset={params.depth_offset:+.3f}")
+                        actor.retry(params=params)
 
             if actor.done():
                 break

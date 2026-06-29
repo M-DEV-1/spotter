@@ -37,7 +37,8 @@ class ClassicalActor:
         self._phase = 0
         self._phase_step = 0
         self._prev = HOME.copy()
-        self._j1_offset = 0.0   # joint1 correction set by retry()
+        self._j1_offset = 0.0    # joint1 correction — set by retry() from Gemma
+        self._depth_offset = 0.0 # joint2 correction in lower phase — set by retry()
 
     def act(self, obs=None) -> np.ndarray:
         if self._phase >= len(SEQUENCE):
@@ -45,10 +46,12 @@ class ClassicalActor:
 
         target_raw, duration, name = SEQUENCE[self._phase]
 
-        # apply joint1 offset only for the phases that aim at the cube
-        if self._j1_offset != 0.0 and name in _GRASP_PHASES:
+        if name in _GRASP_PHASES and (self._j1_offset != 0.0 or self._depth_offset != 0.0):
             target = target_raw.copy()
             target[0] += self._j1_offset
+            if name == "lower":
+                # positive depth_offset → increase joint2 → arm descends further
+                target[1] = np.clip(target[1] + self._depth_offset, 0.6, 1.1)
         else:
             target = target_raw
 
@@ -66,12 +69,14 @@ class ClassicalActor:
     def done(self) -> bool:
         return self._phase >= len(SEQUENCE)
 
-    def retry(self, cube_pos=None) -> None:
-        """Restart from approach. Offset joint1 to aim at cube's actual position."""
-        if cube_pos is not None:
-            cx, cy = float(cube_pos[0]), float(cube_pos[1])
-            # angle from robot base to current cube position
-            self._j1_offset = float(np.arctan2(cy, cx))
+    def retry(self, params=None) -> None:
+        """Restart from approach using RetryParams derived from Gemma's correction.
+        Causal chain: Gemma text → parse_correction() → RetryParams → here.
+        No sim state is read."""
+        if params is not None:
+            # SET each retry (fresh Gemma observation, not accumulate)
+            self._j1_offset = float(params.j1_offset)
+            self._depth_offset = float(params.depth_offset)
         self._phase = 0
         self._phase_step = 0
         # _prev stays as current ctrl for smooth transition back

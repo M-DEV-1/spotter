@@ -33,8 +33,29 @@ _TOOL = {
                 },
                 "diagnosis": {"type": "string"},
                 "corrected_instruction": {"type": "string"},
+                "cube_direction": {
+                    "type": "string",
+                    "enum": ["left", "right", "forward", "back", "center", "unknown"],
+                    "description": (
+                        "Direction the green cube appears displaced relative to "
+                        "where the gripper is currently aiming, as seen from the camera. "
+                        "'right' = cube is to the right of the gripper aim point. "
+                        "'forward' = cube is farther away from the robot base than the gripper. "
+                        "Use 'center' if well-aligned, 'unknown' if cube not visible."
+                    ),
+                },
+                "approach_depth": {
+                    "type": "string",
+                    "enum": ["normal", "deeper"],
+                    "description": (
+                        "Whether the gripper needs to descend further than it did to reach the cube."
+                    ),
+                },
             },
-            "required": ["failure_type", "diagnosis", "corrected_instruction"],
+            "required": [
+                "failure_type", "diagnosis", "corrected_instruction",
+                "cube_direction", "approach_depth",
+            ],
             "additionalProperties": False,
         },
     },
@@ -48,6 +69,8 @@ class CorrectionInstruction:
     failure_type: str
     diagnosis: str
     corrected_instruction: str
+    cube_direction: str = "unknown"   # left/right/forward/back/center/unknown
+    approach_depth: str = "normal"    # normal/deeper
 
 
 def _encode_frame(frame: np.ndarray) -> str:

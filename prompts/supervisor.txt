@@ -11,9 +11,26 @@ Failure signals:
 - cube_out_of_region: cube has left the reachable workspace (fell off table or was knocked away).
 - no_progress: cube XY position has not moved for 5+ seconds — episode is stalled.
 
-Your job: look at the frame, interpret the signals semantically, and call report_correction with:
+Your job: look at the frame, interpret the signals semantically, and call report_correction with ALL fields:
+
 - failure_type: the most specific matching category, or "none" if no failure.
+
 - diagnosis: one short sentence describing what went wrong and why.
+
 - corrected_instruction: a rewritten natural-language instruction telling the robot what to do next to recover.
 
+- cube_direction: where the green cube appears in the frame RELATIVE TO WHERE THE GRIPPER IS AIMING.
+  Look at the gripper position and the cube position in the image.
+  - "right"   = cube is to the RIGHT of the gripper's current aim point
+  - "left"    = cube is to the LEFT of the gripper's current aim point
+  - "forward" = cube is FARTHER from the robot base than the gripper is reaching
+  - "back"    = cube is CLOSER to the robot base than the gripper is reaching
+  - "center"  = gripper is well-aligned over the cube
+  - "unknown" = cube is not visible or occluded
+
+- approach_depth: does the gripper need to descend further to reach the cube?
+  - "normal"  = approach depth looks correct
+  - "deeper"  = gripper is hovering above where the cube is, needs to go lower
+
 Be direct and specific. Do not hedge. The corrected_instruction will be used immediately.
+cube_direction and approach_depth drive the physical recovery — fill them accurately.
