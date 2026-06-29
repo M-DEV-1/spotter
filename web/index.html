@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spotter — LLM-Supervised Robot</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'monospace'] } } } }</script>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+  <script src="data.js"></script>
+  <style>
+    body { font-family: 'JetBrains Mono', monospace; }
+    video { background: #09090b; }
+    .fade-in { animation: fadeIn .4s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  </style>
+</head>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen">
+
+  <!-- header -->
+  <header class="border-b border-zinc-800 px-8 py-5 flex items-center justify-between">
+    <div>
+      <div class="flex items-center gap-3">
+        <span class="text-green-400 text-xl font-bold tracking-tight">SPOTTER</span>
+        <span class="text-zinc-500 text-xs px-2 py-0.5 border border-zinc-700 rounded">Cerebras × Gemma4 Hackathon</span>
+      </div>
+      <p class="text-zinc-400 text-xs mt-1">Gemma 4 31B on Cerebras supervises a Franka Panda arm in real-time MuJoCo simulation</p>
+    </div>
+    <div class="text-right">
+      <div class="text-green-400 font-bold text-2xl" id="speed-badge">~1s</div>
+      <div class="text-zinc-500 text-xs">per Cerebras call</div>
+    </div>
+  </header>
+
+  <main class="px-8 py-8 max-w-7xl mx-auto space-y-8">
+
+    <!-- story line -->
+    <div class="flex items-center gap-2 text-xs text-zinc-400 flex-wrap">
+      <span class="px-2 py-1 bg-zinc-800 rounded">arm reaches for cube</span>
+      <span class="text-zinc-600">→</span>
+      <span class="px-2 py-1 bg-zinc-800 rounded">cube nudged out of place</span>
+      <span class="text-zinc-600">→</span>
+      <span class="px-2 py-1 bg-red-950 text-red-400 rounded">unsupervised fails silently</span>
+      <span class="text-zinc-600">→</span>
+      <span class="px-2 py-1 bg-zinc-800 rounded">Gemma detects + rewrites instruction</span>
+      <span class="text-zinc-600">→</span>
+      <span class="px-2 py-1 bg-green-950 text-green-400 rounded">supervised recovers</span>
+    </div>
+
+    <!-- videos -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+
+      <!-- unsupervised -->
+      <div class="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
+        <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-red-500"></span>
+            <span class="text-sm font-semibold">Without Supervision</span>
+          </div>
+          <span class="text-zinc-500 text-xs" id="unsup-steps"></span>
+        </div>
+        <video id="vid-unsup" class="w-full" controls loop>
+          <source id="src-unsup" type="video/mp4" />
+          Your browser does not support video.
+        </video>
+        <div class="px-4 py-3 text-xs text-zinc-400">
+          Cube nudged → arm follows original trajectory → misses cube → finishes empty. No recovery attempted.
+        </div>
+      </div>
+
+      <!-- supervised -->
+      <div class="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
+        <div class="px-4 py-3 border-b border-zinc-800 flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+            <span class="text-sm font-semibold">With Gemma Supervision</span>
+          </div>
+          <span class="text-zinc-500 text-xs" id="sup-steps"></span>
+        </div>
+        <video id="vid-sup" class="w-full" controls loop>
+          <source id="src-sup" type="video/mp4" />
+          Your browser does not support video.
+        </video>
+        <div class="px-4 py-3 text-xs text-zinc-400">
+          Cube nudged → Gemma detects failure → arm corrects joint aim → retries → picks up + places cube.
+        </div>
+      </div>
+    </div>
+
+    <!-- supervisor log + speed -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+
+      <!-- log -->
+      <div class="md:col-span-2 bg-zinc-900 rounded-xl border border-zinc-800">
+        <div class="px-4 py-3 border-b border-zinc-800">
+          <span class="text-sm font-semibold">Gemma Supervision Log</span>
+          <span class="ml-2 text-zinc-500 text-xs">gemma-4-31b on Cerebras · ~1Hz</span>
+        </div>
+        <div id="log-entries" class="divide-y divide-zinc-800"></div>
+      </div>
+
+      <!-- stats -->
+      <div class="space-y-4">
+
+        <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+          <div class="text-xs text-zinc-500 mb-3 font-semibold uppercase tracking-widest">Cerebras Speed</div>
+          <div class="text-green-400 text-4xl font-bold mb-1">~1s</div>
+          <div class="text-zinc-400 text-xs">per supervisor call</div>
+          <div class="text-zinc-600 text-xs mt-1">gemma-4-31b · 100 RPM limit</div>
+          <div class="mt-3 pt-3 border-t border-zinc-800 text-xs text-zinc-400">
+            Fast inference enables <span class="text-green-400">continuous supervision</span> vs keyframe-only — catching failures sooner before the scene drifts.
+          </div>
+        </div>
+
+        <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+          <div class="text-xs text-zinc-500 mb-3 font-semibold uppercase tracking-widest">Episode Stats</div>
+          <div class="space-y-2 text-xs">
+            <div class="flex justify-between">
+              <span class="text-zinc-400">Unsupervised steps</span>
+              <span id="stat-unsup" class="text-zinc-200 font-semibold">—</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-zinc-400">Supervised steps</span>
+              <span id="stat-sup" class="text-zinc-200 font-semibold">—</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-zinc-400">Retries triggered</span>
+              <span id="stat-retries" class="text-green-400 font-semibold">—</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-zinc-400">Outcome</span>
+              <span class="text-green-400 font-semibold">recovered ✓</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-4">
+          <div class="text-xs text-zinc-500 mb-2 font-semibold uppercase tracking-widest">Prior Art</div>
+          <div class="space-y-1 text-xs text-zinc-400">
+            <div>FPC-VLA · arXiv 2509.04018</div>
+            <div>RoboFAC · arXiv 2505.12224</div>
+            <div>CycleVLA · arXiv 2601.02295</div>
+            <div class="text-zinc-600 pt-1">SayCan, Inner Monologue, Code as Policies</div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- how it works -->
+    <div class="bg-zinc-900 rounded-xl border border-zinc-800 p-6">
+      <div class="text-sm font-semibold mb-4">How It Works</div>
+      <div class="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs text-zinc-400">
+        <div class="space-y-1">
+          <div class="text-green-400 font-semibold">1. Sim</div>
+          <div>Franka Panda arm in MuJoCo. Classical keyframe actor. EGL headless on DGX Spark (ARM64).</div>
+        </div>
+        <div class="space-y-1">
+          <div class="text-green-400 font-semibold">2. Failure signals</div>
+          <div>Cheap ground-truth: gripper_closed_empty, cube_out_of_region, no_progress. No pixel guessing.</div>
+        </div>
+        <div class="space-y-1">
+          <div class="text-green-400 font-semibold">3. Gemma supervisor</div>
+          <div>Camera frame + signals → Gemma 4 31B → structured correction: failure_type + diagnosis + instruction.</div>
+        </div>
+        <div class="space-y-1">
+          <div class="text-green-400 font-semibold">4. Recovery</div>
+          <div>Actor retries with corrected joint aim (atan2 offset). Gemma is the coach, not the planner.</div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <footer class="border-t border-zinc-800 px-8 py-4 text-xs text-zinc-600 flex justify-between">
+    <span>Spotter · Cerebras × Google DeepMind Gemma4 Hackathon · 2026</span>
+    <span>MuJoCo + Cerebras SDK + lerobot</span>
+  </footer>
+
+  <script>
+    // populate from data.js
+    document.getElementById('src-unsup').src = DEMO.unsupervised_video;
+    document.getElementById('src-sup').src   = DEMO.supervised_video;
+    document.getElementById('vid-unsup').load();
+    document.getElementById('vid-sup').load();
+
+    document.getElementById('unsup-steps').textContent = DEMO.unsupervised_steps + ' steps';
+    document.getElementById('sup-steps').textContent   = DEMO.supervised_steps   + ' steps';
+    document.getElementById('stat-unsup').textContent  = DEMO.unsupervised_steps;
+    document.getElementById('stat-sup').textContent    = DEMO.supervised_steps;
+    document.getElementById('stat-retries').textContent = DEMO.retries;
+
+    const failColors = {
+      gripper_missed: 'text-red-400',
+      cube_displaced: 'text-orange-400',
+      no_progress:    'text-yellow-400',
+      none:           'text-zinc-400',
+    };
+
+    const container = document.getElementById('log-entries');
+    DEMO.supervisor_log.forEach((entry, i) => {
+      const c = entry.correction;
+      const color = failColors[c.failure_type] || 'text-zinc-400';
+      container.innerHTML += `
+        <div class="px-4 py-4 fade-in space-y-1">
+          <div class="flex items-center gap-3">
+            <span class="text-zinc-500 text-xs">step ${entry.step}</span>
+            <span class="text-xs px-2 py-0.5 rounded border border-zinc-700 ${color}">${c.failure_type}</span>
+            <span class="text-zinc-600 text-xs">${Object.entries(entry.signals).filter(([,v])=>v).map(([k])=>k).join(', ') || 'no signals'}</span>
+          </div>
+          <div class="text-zinc-400 text-xs"><span class="text-zinc-600">diagnosis  </span>${c.diagnosis}</div>
+          <div class="text-zinc-200 text-xs"><span class="text-zinc-600">correction </span>${c.corrected_instruction}</div>
+        </div>`;
+    });
+  </script>
+</body>
+</html>

@@ -89,9 +89,15 @@ def run_supervised_episode(
     record: bool = True,
     out_path: str = "outputs/supervised.mp4",
     verbose: bool = True,
+    watch: bool = False,
+    watch_port: int = 8080,
+    model=None,
+    data=None,
 ) -> dict:
-    model = load_model()
-    data = make_data(model)
+    if model is None:
+        model = load_model()
+    if data is None:
+        data = make_data(model)
     reset_to_keyframe(model, data, "home")
     init_task(model, data)
     actor.reset()
@@ -107,6 +113,21 @@ def run_supervised_episode(
     post_grasp_armed = False   # True after entering "grasp", cleared after supervisor fires
     last_frame = None          # cached for VLA obs (rendered every 4 steps)
     is_vla = hasattr(actor, "set_instruction")
+
+    viser_scene = None
+    if watch:
+        try:
+            import time, viser, mjviser
+            _server = viser.ViserServer(port=watch_port)
+            viser_scene = mjviser.ViserMujocoScene(_server, model, num_envs=1)
+            print(f"\n  open browser → http://spark-3100:{watch_port}")
+            for i in range(8, 0, -1):
+                print(f"  starting in {i}s ...  ", end="\r", flush=True)
+                time.sleep(1)
+            print("  starting now!          \n")
+        except Exception as e:
+            print(f"  watch mode unavailable: {e}")
+            viser_scene = None
 
     with make_renderer(model) as renderer:
         for step in range(max_steps):
@@ -130,6 +151,9 @@ def run_supervised_episode(
             if record and step % 4 == 0:
                 last_frame = render_frame(model, data, renderer)
                 frames.append(last_frame)
+
+            if viser_scene is not None and step % 4 == 0:
+                viser_scene.update_from_mjdata(data)
 
             # track phase transitions
             if actor.phase_name != last_phase:

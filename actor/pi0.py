@@ -14,15 +14,21 @@ set USE_CARTESIAN_ACTIONS = True and the Jacobian path will be used automaticall
 
 Verify on spark with:
   python -c "
-  from lerobot.common.policies.pi0.modeling_pi0 import Pi0Policy
+  from lerobot.policies.pi0.modeling_pi0 import Pi0Policy
   p = Pi0Policy.from_pretrained('lerobot/pi0_libero_finetuned_v044')
   print('action_dim:', p.config.output_shapes)
   "
 
 # API confirmed from lerobot source — verify on spark if import fails
 """
+import os
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
 import copy
 import numpy as np
+
+import torch
+import torch._dynamo
+torch._dynamo.config.disable = True
 
 DEFAULT_MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
 DEFAULT_INSTRUCTION = "pick up the green cube and place it on the red target"
@@ -59,6 +65,7 @@ class Pi0Actor:
         self._policy = self._load_policy(model_id)
         self._instruction = DEFAULT_INSTRUCTION
         self._step = 0
+
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -123,8 +130,8 @@ class Pi0Actor:
             / 255.0
         )                                                               # (1, 3, H, W)
 
-        # Observation dict key names from lerobot LIBERO config.
-        # See lerobot/configs/policy/pi0_libero.yaml — verify on spark.
+        # Observation dict key names from lerobot pi0_libero config.
+        # Image key and state dim need verification on spark when pi0 is unblocked.
         obs_dict = {
             "observation.state": state_t,           # (1, 8) joint positions
             "observation.images.top": img_t,        # (1, 3, H, W) top-down camera
@@ -171,7 +178,7 @@ class Pi0Actor:
         message if lerobot is not installed."""
         try:
             # API confirmed from lerobot source — verify on spark if import fails
-            from lerobot.common.policies.pi0.modeling_pi0 import Pi0Policy  # noqa: PLC0415
+            from lerobot.policies.pi0.modeling_pi0 import PI0Policy  # noqa: PLC0415
         except ImportError as exc:
             raise ImportError(
                 "lerobot is not installed. To install:\n"
@@ -185,7 +192,7 @@ class Pi0Actor:
         import torch  # noqa: PLC0415
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        policy = Pi0Policy.from_pretrained(model_id)
+        policy = PI0Policy.from_pretrained(model_id)
         policy.eval()
         policy = policy.to(device)
         return policy
