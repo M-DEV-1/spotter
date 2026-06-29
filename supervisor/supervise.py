@@ -52,19 +52,31 @@ def _fire_supervisor(frame, signals, step, client, log, retries, actor, model, d
 
     if correction.failure_type != "none":
         retries += 1
-        # IK path: Gemma triggered → read cube position → compute exact joint targets
+
+        # VLA actors (Pi0Actor): update language conditioning from Gemma's output.
+        # This is the core causal claim — Gemma's words change what the VLA does.
+        if hasattr(actor, "set_instruction"):
+            actor.set_instruction(correction.corrected_instruction)
+
         cpos = get_cube_pos(model, data)
-        above_j, lower_j = solve_approach_grasp(model, data, cpos)
-        if above_j is not None and lower_j is not None:
-            print(f"  [retry {retries}] IK path  cube=({cpos[0]:.3f},{cpos[1]:.3f})\n")
-            actor.retry_to_position(above_j, lower_j)
-            entry["recovery_path"] = "ik"
+        if hasattr(actor, "retry_to_position"):
+            # Classical actor: IK path → exact joint targets
+            above_j, lower_j = solve_approach_grasp(model, data, cpos)
+            if above_j is not None and lower_j is not None:
+                print(f"  [retry {retries}] IK path  cube=({cpos[0]:.3f},{cpos[1]:.3f})\n")
+                actor.retry_to_position(above_j, lower_j)
+                entry["recovery_path"] = "ik"
+            else:
+                # IK failed (out of workspace) — fall back to direction hint
+                params = parse_correction(correction)
+                print(f"  [retry {retries}] direction path  j1={params.j1_offset:+.3f}  depth={params.depth_offset:+.3f}\n")
+                actor.retry(params=params)
+                entry["recovery_path"] = "direction"
         else:
-            # IK failed (out of workspace or no convergence) — fall back to direction hint
-            params = parse_correction(correction)
-            print(f"  [retry {retries}] direction path  j1={params.j1_offset:+.3f}  depth={params.depth_offset:+.3f}\n")
-            actor.retry(params=params)
-            entry["recovery_path"] = "direction"
+            # VLA actor: instruction already updated above; reset step counter
+            print(f"  [retry {retries}] VLA path  cube=({cpos[0]:.3f},{cpos[1]:.3f})\n")
+            actor.retry()
+            entry["recovery_path"] = "vla"
 
     return retries
 
@@ -93,18 +105,31 @@ def run_supervised_episode(
     last_phase = None
     prev_phase = None
     post_grasp_armed = False   # True after entering "grasp", cleared after supervisor fires
+    last_frame = None          # cached for VLA obs (rendered every 4 steps)
+    is_vla = hasattr(actor, "set_instruction")
 
     with make_renderer(model) as renderer:
         for step in range(max_steps):
             if perturb_fn:
                 perturb_fn(model, data, step)
 
-            ctrl = actor.act()
+            # build obs for VLA actors; classical actor ignores obs
+            if is_vla and last_frame is not None:
+                import numpy as np
+                obs = {
+                    "state": data.qpos[:8].astype(np.float32),
+                    "image": last_frame,
+                }
+            else:
+                obs = None
+
+            ctrl = actor.act(obs)
             data.ctrl[:] = ctrl
             mujoco.mj_step(model, data)
 
             if record and step % 4 == 0:
-                frames.append(render_frame(model, data, renderer))
+                last_frame = render_frame(model, data, renderer)
+                frames.append(last_frame)
 
             # track phase transitions
             if actor.phase_name != last_phase:
@@ -146,7 +171,8 @@ def run_supervised_episode(
                 break
 
         if record:
-            frames.append(render_frame(model, data, renderer))
+            last_frame = render_frame(model, data, renderer)
+            frames.append(last_frame)
 
     if record and frames:
         save_mp4(frames, out_path)
