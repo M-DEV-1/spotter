@@ -111,13 +111,15 @@ def solve_approach_grasp(
     cube_pos: np.ndarray,
     site_name: str = "gripper",
     above_offset: float = 0.14,
-    grasp_offset: float = 0.02,
+    grasp_offset: float = 0.0,  # site AT cube center → fingers fully surround cube
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """
     Solve IK for two poses: above the cube and at grasp height.
     Returns (above_joints, grasp_joints) — either may be None if IK fails.
     """
     above_target = cube_pos + np.array([0.0, 0.0, above_offset])
+    # grasp_offset is relative to cube CENTER (qpos z = center, not bottom)
+    # target 0.0 = fingers at cube center height → full grip around cube body
     grasp_target = cube_pos + np.array([0.0, 0.0, grasp_offset])
 
     above_joints = solve_ik(model, data, above_target, site_name)
