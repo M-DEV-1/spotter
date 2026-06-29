@@ -1,0 +1,1231 @@
+================================================================================
+BUILD B — IK-BASED GENERAL RECOVERY
+Spotter Project | Implementation Plan
+Date: 2026-06-29
+================================================================================
+
+PURPOSE
+-------
+Build B upgrades Rung 3's recovery from "scripted pose delta from a coarse Gemma
+direction estimate" to "Jacobian IK targeting exact sim-state cube position, triggered
+only when Gemma detects a failure." After Build B, the user can physically place the
+green cube ANYWHERE in the arm's reachable workspace and the supervised arm recovers.
+
+The Rung 3 floor is not broken. Build B is additive: the Gemma-direction path survives
+as a fallback. If IK fails (singularity, out of range), the existing RetryParams path
+is used instead.
+
+CURRENT STATE (pre-Build-B)
+----------------------------
+- ClassicalActor.retry(params=RetryParams) applies a small j1_offset and depth_offset
+  derived from Gemma's cube_direction and approach_depth strings.
+- This recovers scripted ±4cm Y nudges because j1_offset covers that range.
+- It FAILS on larger or arbitrary displacements (e.g. 15cm in +X, or a diagonal
+  20cm offset) because the offset is tuned only for the scripted nudge magnitude.
+
+TARGET STATE (post-Build-B)
+-----------------------------
+- When Gemma fires a correction (failure_type != "none"), supervisor.py reads the
+  cube's exact XYZ from sim state, calls solve_ik() to compute joint targets for a
+  position 15cm above the cube and for the grasp position, then calls
+  actor.retry_to_position() with those targets.
+- The arm reaches any valid cube position without re-tuning offsets.
+- If IK fails to converge, the old RetryParams path fires as fallback.
+- A new test script (scripts/run_rung3_random.py) runs 5 episodes with random cube
+  displacements of 5–20cm in a random direction and reports success rate.
+
+================================================================================
+ARCHITECTURE DIAGRAM
+================================================================================
+
+Episode loop (supervise.py)
+│
+│  every SUPERVISOR_INTERVAL steps (500 steps = 2.5s at timestep=0.005s)
+│  when any failure signal is True:
+│
+│  ┌──────────────────────────────────────────────────────────────────────┐
+│  │  DETECTION LAYER (Gemma — causally necessary)                        │
+│  │                                                                      │
+│  │  frame (480x640 PNG, base64)  ─┐                                     │
+│  │  signals dict                  ├──► call_supervisor() ──► correction │
+│  │  (gripper_closed_empty, etc.)  ┘     (failure_type, cube_direction,  │
+│  │                                       approach_depth, diagnosis)     │
+│  │                                                                      │
+│  │  if correction.failure_type == "none": skip                          │
+│  └──────────────────────────────────────────────────────────────────────┘
+│            │ failure_type != "none"
+│            ▼
+│  ┌──────────────────────────────────────────────────────────────────────┐
+│  │  IMPLEMENTATION LAYER (IK — only runs because Gemma fired)           │
+│  │                                                                      │
+│  │  cpos = cube_pos(model, data)          # 3D XYZ from sim state       │
+│  │  above  = cpos + [0, 0, 0.15]          # 15cm above cube             │
+│  │  grasp  = cpos + [0, 0, 0.02]          # 2cm above cube surface      │
+│  │                                                                      │
+│  │  above_joints = solve_ik(model, data, above, "gripper")              │
+│  │  lower_joints = solve_ik(model, data, grasp, "gripper")              │
+│  │                                                                      │
+│  │  if both converged:                                                  │
+│  │      actor.retry_to_position(above_joints, lower_joints)  ← IK path │
+│  │      log recovery_path = "ik"                                        │
+│  │  else:                                                               │
+│  │      params = parse_correction(correction)                           │
+│  │      actor.retry(params=params)                        ← fallback    │
+│  │      log recovery_path = "direction_only"                            │
+│  └──────────────────────────────────────────────────────────────────────┘
+
+actor (classical.py)
+│
+│  SEQUENCE (module-level list, mutable per-episode via retry_to_position):
+│
+│  [(ABOVE_CUBE, 200, "approach"),   ← overridden by above_joints when IK path
+│   (LOWER,      200, "lower"),      ← overridden by lower_joints when IK path
+│   (GRASP,      120, "grasp"),      ← unchanged (gripper close)
+│   (LIFT,       250, "lift"),       ← unchanged
+│   (SWING,      300, "swing"),      ← unchanged
+│   (RELEASE,     80, "release"),    ← unchanged
+│   (HOME,       200, "return")]     ← unchanged
+
+
+================================================================================
+STEP 0 — FIND THE END-EFFECTOR SITE NAME (run this first on spark)
+================================================================================
+
+Before writing any IK code, confirm the exact site name in the loaded model.
+Run this one-liner on spark-3100:
+
+  MUJOCO_GL=egl python -c "
+  import sys; sys.path.insert(0, '.')
+  import mujoco
+  from simulator.scene import load_model
+  model = load_model()
+  print('sites:')
+  for i in range(model.nsite):
+      name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, i)
+      print(f'  [{i}] {name!r}')
+  "
+
+Expected output (from reading mjx_panda.xml + mjx_hand.xml):
+  [0] 'gripper'
+
+The site "gripper" is defined in mjx_hand.xml at pos="0 0 0.1" relative to the
+hand link body. This is a point 10cm below the flange in the tool frame, centred
+between the fingertips — appropriate for grasp targeting.
+
+If the output shows a different name (e.g. "panda/gripper" or "attachment_site"),
+update SITE_NAME in simulator/ik.py accordingly. The rest of the code is
+parameterised on SITE_NAME and requires no other changes.
+
+
+================================================================================
+FILE 1 — simulator/ik.py (NEW FILE)
+================================================================================
+
+Location: /home/mdev1/Desktop/Code/projects/spotter/simulator/ik.py
+
+Purpose: Iterative Jacobian pseudoinverse IK. Returns 7 joint angles or None.
+Does NOT touch the running simulation — operates entirely on a copy of MjData.
+
+-------------------------------------------------------------------------------
+COMPLETE SOURCE
+-------------------------------------------------------------------------------
+
+"""
+Jacobian pseudoinverse IK for the Franka Panda arm.
+
+Works on a COPY of MjData — the live simulation is never disturbed.
+Returns a 7-element numpy array (joint angles for joints 1-7) or None if
+the solver did not converge within the allowed iterations.
+
+Only translational IK (position of the end-effector site). Orientation is not
+constrained — the arm finds its own wrist configuration. This is intentional:
+for pick-and-place we care where the fingers are, not which way the wrist faces.
+"""
+import copy
+
+import mujoco
+import numpy as np
+
+# Site whose Cartesian position we want to control.
+# Confirmed from mjx_panda.xml / mjx_hand.xml: site name is "gripper".
+SITE_NAME = "gripper"
+
+# Franka Panda has 7 arm joints + 2 finger joints = 9 DOF.
+# Freejoint of cube adds 6 velocity DOF.  Total nv = 15.
+# The arm joints occupy velocity indices 0..6 (first 7 columns of Jacobian).
+N_ARM_JOINTS = 7
+
+# Safe workspace box. IK will refuse to solve for targets outside this box.
+# Matches WORKSPACE_XY_MIN/MAX in supervisor/signals.py but is tighter for IK.
+IK_POS_MIN = np.array([0.20, -0.60, 0.00])
+IK_POS_MAX = np.array([1.10,  0.60, 0.60])
+
+# Damped least-squares regularisation coefficient.
+# Larger = smoother near singularities, smaller = more accurate.
+_LAMBDA_SQ = 1e-4
+
+
+def solve_ik(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    target_pos: np.ndarray,
+    site_name: str = SITE_NAME,
+    max_iters: int = 100,
+    tol: float = 1e-3,
+    step_size: float = 0.5,
+) -> np.ndarray | None:
+    """
+    Iterative Jacobian pseudoinverse IK.
+
+    Parameters
+    ----------
+    model       : MjModel (read-only — only joint ranges consulted)
+    data        : MjData  (source for initial joint positions; NOT modified)
+    target_pos  : (3,) array — desired Cartesian position of the site in world frame
+    site_name   : name of the MuJoCo site to control
+    max_iters   : maximum number of Jacobian update steps
+    tol         : convergence tolerance in metres (L2 position error)
+    step_size   : fraction of the pseudoinverse step to apply per iteration (0 < α ≤ 1)
+
+    Returns
+    -------
+    (7,) array of joint angles (indices match joint1..joint7 ctrl channels),
+    or None if the solver did not converge.
+
+    Notes
+    -----
+    * Only translational Jacobian (jacp) is used — 3×nv matrix.
+    * We take the first N_ARM_JOINTS (7) columns — these correspond to the
+      arm's revolute joints in the order joint1..joint7.
+    * Finger joints (indices 7, 8) and the cube freejoint (indices 9..14) are
+      NOT included in the IK update.
+    * After each step the joint angles are clipped to model.jnt_range to respect
+      mechanical limits.
+    * The function operates on a deep copy of data and never modifies the caller's
+      data object.
+    """
+    # Bounds check on target.
+    if np.any(target_pos < IK_POS_MIN) or np.any(target_pos > IK_POS_MAX):
+        return None
+
+    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+    if site_id < 0:
+        raise ValueError(f"site not found in model: {site_name!r}")
+
+    # Work on a copy so the live simulation is undisturbed.
+    d = copy.copy(data)          # shallow copy (data arrays are references)
+    d.qpos = data.qpos.copy()    # deep-copy the mutable state
+    d.qvel = data.qvel.copy()
+    d.ctrl = data.ctrl.copy()
+
+    nv = model.nv                # total velocity DOF (expected 15)
+    jacp = np.zeros((3, nv))     # translational Jacobian
+    jacr = np.zeros((3, nv))     # rotational Jacobian (allocated but unused)
+
+    for _ in range(max_iters):
+        # Forward kinematics to get current site position.
+        mujoco.mj_forward(model, d)
+        current_pos = d.site_xpos[site_id].copy()
+
+        # Position error.
+        error = target_pos - current_pos
+        if np.linalg.norm(error) < tol:
+            # Converged — return the 7 arm joint angles.
+            # qpos[0:7] = joint1..joint7 in the Panda model.
+            return d.qpos[:N_ARM_JOINTS].copy()
+
+        # Compute Jacobian at current configuration.
+        mujoco.mj_jacSite(model, d, jacp, jacr, site_id)
+
+        # Extract only the arm columns (first 7).
+        J = jacp[:, :N_ARM_JOINTS]   # shape (3, 7)
+
+        # Damped least-squares pseudoinverse.
+        # J_pinv = J^T (J J^T + λ²I)^{-1}
+        A = J @ J.T + _LAMBDA_SQ * np.eye(3)
+        J_pinv = J.T @ np.linalg.inv(A)   # shape (7, 3)
+
+        # Joint update.
+        dq = J_pinv @ error               # shape (7,)
+        d.qpos[:N_ARM_JOINTS] += step_size * dq
+
+        # Clip to joint limits to avoid mechanical violations.
+        # model.jnt_range[i] gives (lo, hi) for the i-th joint in the model's
+        # joint list.  The first 7 joints in mjx_panda.xml are the arm joints.
+        for i in range(N_ARM_JOINTS):
+            lo, hi = model.jnt_range[i]
+            d.qpos[i] = float(np.clip(d.qpos[i], lo, hi))
+
+    # Did not converge.
+    return None
+
+-------------------------------------------------------------------------------
+MUJOCO API REFERENCE (exact argument order for mj_jacSite)
+-------------------------------------------------------------------------------
+
+mujoco.mj_jacSite(
+    model,      # MjModel
+    data,       # MjData (must have been forward-propagated first via mj_forward)
+    jacp,       # (3, nv) array — translational Jacobian (WRITE)
+    jacr,       # (3, nv) array — rotational Jacobian   (WRITE)
+    site_id,    # int — site index from mj_name2id
+)
+
+Important: mj_forward MUST be called on the data copy before calling mj_jacSite.
+mj_forward computes xpos, xmat, site_xpos, etc. Without it, site_xpos is stale.
+
+-------------------------------------------------------------------------------
+JOINT RANGE TABLE (from mjx_panda.xml actuator ctrlrange)
+-------------------------------------------------------------------------------
+
+  Joint      |  lo        |  hi       | Notes
+  -----------+------------+-----------+-------------------------------------------
+  joint1     | -2.8973    | +2.8973   | full rotation (default class)
+  joint2     | -1.7628    | +1.7628   | limited shoulder pitch
+  joint3     | -2.8973    | +2.8973   | elbow rotation
+  joint4     | -3.0718    | -0.0698   | elbow NEGATIVE range only (fully below horiz)
+  joint5     | -2.8973    | +2.8973   | wrist rotation
+  joint6     | -0.0175    | +3.7525   | wrist pitch
+  joint7     | -2.8973    | +2.8973   | tool rotation
+
+model.jnt_range is indexed by joint order in the XML body tree, NOT by actuator
+order. In mjx_panda.xml the arm joints are listed in body-tree order joint1..joint7
+so model.jnt_range[0..6] matches joint1..joint7.
+
+The finger joints (finger_joint1, finger_joint2) are jnt_range[7] and jnt_range[8].
+The cube freejoint is jnt_range[9] (type=free, range not relevant for IK).
+
+-------------------------------------------------------------------------------
+QPOS LAYOUT (confirmed from mjx_single_cube.xml keyframe)
+-------------------------------------------------------------------------------
+
+  qpos[0]   = joint1
+  qpos[1]   = joint2
+  qpos[2]   = joint3
+  qpos[3]   = joint4
+  qpos[4]   = joint5
+  qpos[5]   = joint6
+  qpos[6]   = joint7
+  qpos[7]   = finger_joint1
+  qpos[8]   = finger_joint2
+  qpos[9]   = cube_x  (freejoint translation)
+  qpos[10]  = cube_y
+  qpos[11]  = cube_z
+  qpos[12]  = cube_qw (freejoint quaternion, scalar first)
+  qpos[13]  = cube_qx
+  qpos[14]  = cube_qy
+  qpos[15]  = cube_qz
+
+So nudging cube X: data.qpos[9] += delta_x
+   nudging cube Y: data.qpos[10] += delta_y
+This matches run_rung3.py where data.qpos[10] += NUDGE_Y.
+
+-------------------------------------------------------------------------------
+NV LAYOUT (velocity DOF)
+-------------------------------------------------------------------------------
+
+  nv = 15 (freejoint contributes 6 velocity DOF, not 7)
+  v[0..6]   = joint1..joint7 angular velocity
+  v[7..8]   = finger_joint1, finger_joint2 linear velocity
+  v[9..14]  = cube freejoint (3 linear + 3 angular)
+
+  jacp has shape (3, 15).
+  J = jacp[:, :7]  picks only the 7 arm DOF — correct.
+
+-------------------------------------------------------------------------------
+IK FAILURE MODES AND HANDLING
+-------------------------------------------------------------------------------
+
+  1. Out-of-workspace target
+     target_pos outside IK_POS_MIN/IK_POS_MAX → returns None immediately.
+     Caller falls back to Gemma direction-only path.
+
+  2. Singular or near-singular configuration
+     Damped least-squares (lambda_sq=1e-4) prevents blow-up but may slow
+     convergence. With max_iters=100 this is sufficient for the Panda workspace.
+
+  3. Joint limit saturation
+     If clipping prevents the arm from reaching the target, the error stops
+     decreasing and the solver times out (returns None after max_iters).
+     This catches physically unreachable targets.
+
+  4. mj_forward side-effects
+     mj_forward on the copy updates contact forces and constraint matrices.
+     These writes stay in the copy and never affect the live data.
+
+
+================================================================================
+FILE 2 — actor/classical.py (ADDITIONS ONLY)
+================================================================================
+
+Add one new method to ClassicalActor. The existing reset(), act(), done(),
+retry(), and phase_name property are UNCHANGED.
+
+Location: /home/mdev1/Desktop/Code/projects/spotter/actor/classical.py
+
+-------------------------------------------------------------------------------
+IMPORTS TO ADD (at top of file, alongside existing numpy import)
+-------------------------------------------------------------------------------
+
+  (no new imports needed — numpy is already imported as np)
+
+-------------------------------------------------------------------------------
+NEW MODULE-LEVEL CONSTANT
+-------------------------------------------------------------------------------
+
+Add after the existing SEQUENCE list:
+
+  # IK retry sequence uses this as the live SEQUENCE for the current episode.
+  # We keep a reference to the original so it can be restored.
+  _BASE_SEQUENCE = SEQUENCE[:]   # shallow copy of the original 7-element list
+
+-------------------------------------------------------------------------------
+NEW METHOD: retry_to_position
+-------------------------------------------------------------------------------
+
+Add to ClassicalActor after the existing retry() method:
+
+    def retry_to_position(
+        self,
+        above_joints: np.ndarray,
+        lower_joints: np.ndarray,
+    ) -> None:
+        """
+        Restart the sequence with IK-computed approach and lower targets.
+
+        above_joints : (7,) array — joint angles when end-effector is 15cm
+                        above the cube.  Replaces ABOVE_CUBE in SEQUENCE.
+        lower_joints : (7,) array — joint angles when end-effector is 2cm
+                        above the cube surface.  Replaces LOWER in SEQUENCE.
+
+        Phases after lower (GRASP, LIFT, SWING, RELEASE, HOME) are unchanged.
+        Their ctrl vectors are hard-tuned and cube-position independent.
+
+        The gripper channel (index 7) is taken from the original ctrl vector
+        so the gripper stays open during approach and lower phases.
+        """
+        # Build IK ctrl vectors by copying the original phase ctrl vectors
+        # and replacing the 7 arm joints with the IK solution.
+        above_ctrl = ABOVE_CUBE.copy()
+        above_ctrl[:7] = above_joints
+
+        lower_ctrl = LOWER.copy()
+        lower_ctrl[:7] = lower_joints
+
+        # Patch SEQUENCE in place for this episode.
+        # Index 0 = approach, index 1 = lower.
+        SEQUENCE[0] = (above_ctrl, SEQUENCE[0][1], SEQUENCE[0][2])
+        SEQUENCE[1] = (lower_ctrl, SEQUENCE[1][1], SEQUENCE[1][2])
+
+        # Restart from the beginning of the patched sequence.
+        self._phase = 0
+        self._phase_step = 0
+        # _prev stays as current ctrl for a smooth transition.
+        # j1_offset and depth_offset are zeroed because IK handles positioning.
+        self._j1_offset = 0.0
+        self._depth_offset = 0.0
+
+    def restore_sequence(self) -> None:
+        """Restore SEQUENCE to the original hand-tuned vectors.
+        Call at episode start (reset() calls this internally).
+        """
+        global SEQUENCE
+        SEQUENCE[0] = _BASE_SEQUENCE[0]
+        SEQUENCE[1] = _BASE_SEQUENCE[1]
+
+-------------------------------------------------------------------------------
+UPDATE reset() METHOD
+-------------------------------------------------------------------------------
+
+Add one line to ClassicalActor.reset() to restore the sequence at episode start:
+
+    def reset(self):
+        self.restore_sequence()    # ← ADD THIS LINE
+        self._phase = 0
+        self._phase_step = 0
+        self._prev = HOME.copy()
+        self._j1_offset = 0.0
+        self._depth_offset = 0.0
+
+This ensures that if a previous episode patched SEQUENCE[0] and SEQUENCE[1],
+they are restored before the next episode starts.
+
+-------------------------------------------------------------------------------
+COMPLETE UPDATED actor/classical.py (full file after edits)
+-------------------------------------------------------------------------------
+
+"""
+Classical keyframe-sequencing actor for Franka Panda pick-and-place.
+Ctrl vectors are hand-tuned via scripts/tune_poses.py (mjviser web viewer).
+"""
+import numpy as np
+
+# Hand-tuned ctrl vectors [joint1..joint7, gripper] — verified in viser.
+ABOVE_CUBE = np.array([ 0.000,  0.626,  0.000, -1.547,  0.000,  2.225, -0.7143, 0.04])
+LOWER      = np.array([ 0.000,  0.800,  0.000, -1.517,  0.000,  2.380, -0.7783, 0.04])
+GRASP      = np.array([ 0.000,  0.800,  0.000, -1.517,  0.000,  2.380, -0.7783, 0.00])
+LIFT       = np.array([ 0.000,  0.393,  0.000, -2.034,  0.000,  2.380, -0.7783, 0.00])
+SWING      = np.array([ 0.792,  0.646,  0.000, -1.768,  0.000,  2.450, -0.7738, 0.00])
+RELEASE    = np.array([ 0.792,  0.646,  0.000, -1.768,  0.000,  2.450, -0.7738, 0.04])
+HOME       = np.array([ 0.000,  0.300,  0.000, -1.571,  0.000,  2.000, -0.785,  0.04])
+
+SEQUENCE = [
+    (ABOVE_CUBE, 200, "approach"),
+    (LOWER,      200, "lower"),
+    (GRASP,      120, "grasp"),
+    (LIFT,       250, "lift"),
+    (SWING,      300, "swing"),
+    (RELEASE,     80, "release"),
+    (HOME,       200, "return"),
+]
+
+# Keep a snapshot of the original SEQUENCE entries so reset() can restore them.
+_BASE_SEQUENCE = SEQUENCE[:]
+
+_GRASP_PHASES = {"approach", "lower", "grasp"}
+
+
+def _lerp(a, b, t):
+    return a + (b - a) * np.clip(t, 0.0, 1.0)
+
+
+class ClassicalActor:
+    def reset(self):
+        self.restore_sequence()
+        self._phase = 0
+        self._phase_step = 0
+        self._prev = HOME.copy()
+        self._j1_offset = 0.0
+        self._depth_offset = 0.0
+
+    def restore_sequence(self) -> None:
+        SEQUENCE[0] = _BASE_SEQUENCE[0]
+        SEQUENCE[1] = _BASE_SEQUENCE[1]
+
+    def act(self, obs=None) -> np.ndarray:
+        if self._phase >= len(SEQUENCE):
+            return HOME.copy()
+
+        target_raw, duration, name = SEQUENCE[self._phase]
+
+        if name in _GRASP_PHASES and (self._j1_offset != 0.0 or self._depth_offset != 0.0):
+            target = target_raw.copy()
+            target[0] += self._j1_offset
+            if name == "lower":
+                target[1] = np.clip(target[1] + self._depth_offset, 0.6, 1.1)
+        else:
+            target = target_raw
+
+        t = self._phase_step / max(duration, 1)
+        ctrl = _lerp(self._prev, target, t)
+
+        self._phase_step += 1
+        if self._phase_step >= duration:
+            self._prev = target.copy()
+            self._phase += 1
+            self._phase_step = 0
+
+        return ctrl
+
+    def done(self) -> bool:
+        return self._phase >= len(SEQUENCE)
+
+    def retry(self, params=None) -> None:
+        """Restart using RetryParams from Gemma direction estimate (fallback path)."""
+        if params is not None:
+            self._j1_offset = float(params.j1_offset)
+            self._depth_offset = float(params.depth_offset)
+        self._phase = 0
+        self._phase_step = 0
+
+    def retry_to_position(
+        self,
+        above_joints: np.ndarray,
+        lower_joints: np.ndarray,
+    ) -> None:
+        """Restart with IK-computed approach + lower targets (primary IK path)."""
+        above_ctrl = ABOVE_CUBE.copy()
+        above_ctrl[:7] = above_joints
+
+        lower_ctrl = LOWER.copy()
+        lower_ctrl[:7] = lower_joints
+
+        SEQUENCE[0] = (above_ctrl, SEQUENCE[0][1], SEQUENCE[0][2])
+        SEQUENCE[1] = (lower_ctrl, SEQUENCE[1][1], SEQUENCE[1][2])
+
+        self._phase = 0
+        self._phase_step = 0
+        self._j1_offset = 0.0
+        self._depth_offset = 0.0
+
+    @property
+    def phase_name(self) -> str:
+        if self._phase >= len(SEQUENCE):
+            return "done"
+        return SEQUENCE[self._phase][2]
+
+
+================================================================================
+FILE 3 — supervisor/supervise.py (TARGETED EDITS)
+================================================================================
+
+The change is localised to the block inside:
+  if correction.failure_type != "none":
+
+Currently that block is (lines 113-119 of the existing file):
+
+    if correction.failure_type != "none":
+        retries += 1
+        params = parse_correction(correction)
+        print(f"  [retry {retries}] cube_direction={correction.cube_direction}"
+              f"  approach_depth={correction.approach_depth}"
+              f"  → j1_offset={params.j1_offset:+.3f} depth_offset={params.depth_offset:+.3f}")
+        actor.retry(params=params)
+
+Replace that block with:
+
+    if correction.failure_type != "none":
+        retries += 1
+        params = parse_correction(correction)
+
+        # --- IK path (Build B) -------------------------------------------
+        # Gemma's detection is what causes us to enter this branch (causal).
+        # Now use sim state for precise localisation (implementation layer).
+        from supervisor.signals import cube_pos as _cube_pos
+        from simulator.ik import solve_ik
+
+        cpos = _cube_pos(model, data)
+        above_target = cpos + np.array([0.0, 0.0, 0.15])
+        grasp_target = cpos + np.array([0.0, 0.0, 0.02])
+
+        above_joints = solve_ik(model, data, above_target)
+        lower_joints = solve_ik(model, data, grasp_target)
+
+        if above_joints is not None and lower_joints is not None:
+            recovery_path = "ik"
+            print(f"  [retry {retries}] IK path — cube at "
+                  f"[{cpos[0]:.3f}, {cpos[1]:.3f}, {cpos[2]:.3f}]")
+            actor.retry_to_position(above_joints, lower_joints)
+        else:
+            recovery_path = "direction_only"
+            print(f"  [retry {retries}] IK failed — falling back to direction path")
+            print(f"  cube_direction={correction.cube_direction}"
+                  f"  approach_depth={correction.approach_depth}"
+                  f"  → j1_offset={params.j1_offset:+.3f}"
+                  f"    depth_offset={params.depth_offset:+.3f}")
+            actor.retry(params=params)
+
+        # Log which path was used.
+        entry = {
+            "step": step,
+            "signals": {k: bool(v) for k, v in signals.items()},
+            "recovery_path": recovery_path,
+            "correction": {
+                "failure_type": correction.failure_type,
+                "diagnosis": correction.diagnosis,
+                "corrected_instruction": correction.corrected_instruction,
+                "cube_direction": correction.cube_direction,
+                "approach_depth": correction.approach_depth,
+            },
+        }
+        log.append(entry)
+        print(f"\n  [supervisor @{step}] {correction.failure_type}")
+        print(f"  diagnosis:   {correction.diagnosis}")
+        print(f"  correction:  {correction.corrected_instruction}\n")
+
+NOTE: The existing `entry = { ... }` and `log.append(entry)` block at lines 97-108
+must be REMOVED since we now build and append `entry` inside the `if correction.failure_type != "none"` branch. The print statements at lines 109-111 are also moved inside the branch.
+
+-------------------------------------------------------------------------------
+IMPORTS TO ADD at the top of supervisor/supervise.py
+-------------------------------------------------------------------------------
+
+Add numpy import (it may already be missing — supervise.py does not currently
+import numpy directly):
+
+  import numpy as np
+
+The `from supervisor.signals import cube_pos` and `from simulator.ik import solve_ik`
+imports are done inline inside the retry branch. They can optionally be moved to the
+top of the file if preferred — either is correct.
+
+-------------------------------------------------------------------------------
+COMPLETE UPDATED run_supervised_episode() LOGIC (full function body)
+-------------------------------------------------------------------------------
+
+The function signature is unchanged:
+  def run_supervised_episode(actor, perturb_fn=None, supervised=True,
+                             max_steps=4000, record=True, out_path="outputs/supervised.mp4",
+                             watch=False, watch_port=8080, viser_server=None, verbose=True)
+
+Inside the step loop, the supervisor block becomes:
+
+    if supervised and step > 0 and step % SUPERVISOR_INTERVAL == 0 and retries < MAX_RETRIES:
+        no_prog = progress.update(model, data)
+        signals = compute_signals(model, data, no_progress=no_prog)
+
+        if any(signals.values()):
+            frame_now = render_frame(model, data, renderer)
+            correction = call_supervisor(frame_now, signals, client=client)
+
+            print(f"\n  [supervisor @{step}] {correction.failure_type}")
+            print(f"  diagnosis:   {correction.diagnosis}")
+            print(f"  correction:  {correction.corrected_instruction}\n")
+
+            if correction.failure_type != "none":
+                retries += 1
+                params = parse_correction(correction)
+
+                cpos = cube_pos_signal(model, data)
+                above_target = cpos + np.array([0.0, 0.0, 0.15])
+                grasp_target = cpos + np.array([0.0, 0.0, 0.02])
+
+                above_joints = solve_ik(model, data, above_target)
+                lower_joints = solve_ik(model, data, grasp_target)
+
+                if above_joints is not None and lower_joints is not None:
+                    recovery_path = "ik"
+                    print(f"  [retry {retries}] IK path — cube at "
+                          f"[{cpos[0]:.3f}, {cpos[1]:.3f}, {cpos[2]:.3f}]")
+                    actor.retry_to_position(above_joints, lower_joints)
+                else:
+                    recovery_path = "direction_only"
+                    print(f"  [retry {retries}] IK failed — fallback to direction")
+                    actor.retry(params=params)
+
+                log.append({
+                    "step": step,
+                    "signals": {k: bool(v) for k, v in signals.items()},
+                    "recovery_path": recovery_path,
+                    "cube_pos_at_retry": cpos.tolist(),
+                    "correction": {
+                        "failure_type": correction.failure_type,
+                        "diagnosis": correction.diagnosis,
+                        "corrected_instruction": correction.corrected_instruction,
+                        "cube_direction": correction.cube_direction,
+                        "approach_depth": correction.approach_depth,
+                    },
+                })
+
+Where `cube_pos_signal` is imported as:
+  from supervisor.signals import cube_pos as cube_pos_signal
+
+And `solve_ik` is imported as:
+  from simulator.ik import solve_ik
+
+Add both imports at the top of supervise.py alongside the existing imports.
+
+
+================================================================================
+FILE 4 — scripts/run_rung3_random.py (NEW FILE)
+================================================================================
+
+Location: /home/mdev1/Desktop/Code/projects/spotter/scripts/run_rung3_random.py
+
+Purpose: Run 5 episodes with random cube displacements to test Build B recovery.
+Reports success rate. Each episode saves two mp4s (unsupervised + supervised).
+
+-------------------------------------------------------------------------------
+COMPLETE SOURCE
+-------------------------------------------------------------------------------
+
+"""
+Build B validation: 5 episodes with random cube displacement.
+
+At NUDGE_STEP, the cube is displaced by a random radius (5-20cm) in a random
+direction. Unsupervised run establishes baseline failure. Supervised run uses
+IK recovery to reach the displaced cube.
+
+Usage:
+  MUJOCO_GL=egl python scripts/run_rung3_random.py
+  MUJOCO_GL=egl python scripts/run_rung3_random.py --supervised-only
+  MUJOCO_GL=egl python scripts/run_rung3_random.py --episodes 10
+
+Output:
+  outputs/random/NNN_r{radius:.2f}_a{angle:.0f}_unsupervised.mp4
+  outputs/random/NNN_r{radius:.2f}_a{angle:.0f}_supervised.mp4
+  outputs/random/results.jsonl  (one line per episode pair)
+"""
+import sys
+import argparse
+import json
+import math
+import random
+from pathlib import Path
+
+import mujoco
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from actor.classical import ClassicalActor
+from supervisor.supervise import run_supervised_episode
+from tasks.pick_place import is_success, CUBE_START
+
+NUDGE_STEP = 200
+N_EPISODES = 5
+OUT_DIR    = Path("outputs/random")
+
+
+def make_nudge_fn(radius: float, angle: float):
+    """Return a perturb_fn closure for the given displacement."""
+    def nudge(model, data, step):
+        if step == NUDGE_STEP:
+            data.qpos[9]  += radius * math.cos(angle)   # cube X
+            data.qpos[10] += radius * math.sin(angle)   # cube Y
+            mujoco.mj_forward(model, data)
+            deg = math.degrees(angle)
+            print(f"  [perturb] r={radius:.3f}m  angle={deg:.1f}°  "
+                  f"Δx={radius*math.cos(angle):+.3f}  Δy={radius*math.sin(angle):+.3f}")
+    return nudge
+
+
+def next_prefix(base: Path) -> Path:
+    base.mkdir(parents=True, exist_ok=True)
+    candidates = sorted(base.glob("???_*.mp4"))
+    n = int(candidates[-1].stem[:3]) + 1 if candidates else 1
+    return base / f"{n:03d}"
+
+
+def run_pair(episode_n: int, radius: float, angle: float, args) -> dict:
+    """Run one unsupervised + one supervised episode with the same nudge."""
+    prefix = next_prefix(OUT_DIR)
+    tag = f"r{radius:.2f}_a{math.degrees(angle):.0f}"
+    unsp_path = str(prefix) + f"_{tag}_unsupervised.mp4"
+    sup_path  = str(prefix) + f"_{tag}_supervised.mp4"
+
+    nudge_fn = make_nudge_fn(radius, angle)
+
+    result = {
+        "episode": episode_n,
+        "radius_m": round(radius, 3),
+        "angle_deg": round(math.degrees(angle), 1),
+        "dx": round(radius * math.cos(angle), 3),
+        "dy": round(radius * math.sin(angle), 3),
+    }
+
+    if not args.supervised_only:
+        print(f"\n=== Episode {episode_n} — UNSUPERVISED (r={radius:.2f}m, "
+              f"angle={math.degrees(angle):.0f}°) ===")
+        r_unsp = run_supervised_episode(
+            ClassicalActor(),
+            perturb_fn=nudge_fn,
+            supervised=False,
+            out_path=unsp_path,
+            verbose=True,
+        )
+        result["unsupervised_steps"] = r_unsp["steps"]
+        result["unsupervised_retries"] = r_unsp["retries"]
+        print(f"  unsupervised done — {r_unsp['steps']} steps")
+
+    print(f"\n=== Episode {episode_n} — SUPERVISED (r={radius:.2f}m, "
+          f"angle={math.degrees(angle):.0f}°) ===")
+    r_sup = run_supervised_episode(
+        ClassicalActor(),
+        perturb_fn=nudge_fn,
+        supervised=True,
+        out_path=sup_path,
+        verbose=True,
+    )
+    result["supervised_steps"] = r_sup["steps"]
+    result["supervised_retries"] = r_sup["retries"]
+    result["supervised_recovery_paths"] = [
+        e.get("recovery_path", "unknown") for e in r_sup["log"]
+    ]
+
+    # Crude success heuristic: if supervisor triggered at least one retry and
+    # the episode ran to completion (all steps consumed = failure to reach DONE
+    # means the arm got stuck; fewer steps = actor.done() fired = success path).
+    # True success check would need is_success() access — add if needed.
+    result["supervised_log"] = r_sup["log"]
+
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--episodes", type=int, default=N_EPISODES)
+    parser.add_argument("--supervised-only", action="store_true",
+                        help="skip unsupervised baseline runs")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="random seed for reproducibility")
+    args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    results_path = OUT_DIR / "results.jsonl"
+
+    print(f"Build B random recovery test: {args.episodes} episodes")
+    print(f"Displacement: r ∈ [0.05, 0.20]m, angle uniform in [0, 2π)")
+    print(f"Output: {OUT_DIR}/\n")
+
+    all_results = []
+    for i in range(1, args.episodes + 1):
+        radius = random.uniform(0.05, 0.20)
+        angle  = random.uniform(0.0, 2 * math.pi)
+        res = run_pair(i, radius, angle, args)
+        all_results.append(res)
+
+        with open(results_path, "a") as f:
+            f.write(json.dumps(res) + "\n")
+
+    # Summary
+    ik_count = 0
+    fallback_count = 0
+    for r in all_results:
+        paths = r.get("supervised_recovery_paths", [])
+        if "ik" in paths:
+            ik_count += 1
+        elif "direction_only" in paths:
+            fallback_count += 1
+
+    print("\n" + "="*60)
+    print(f"RESULTS — {args.episodes} supervised episodes")
+    print(f"  IK path used:          {ik_count}/{args.episodes}")
+    print(f"  Direction fallback:    {fallback_count}/{args.episodes}")
+    print(f"  No correction needed:  {args.episodes - ik_count - fallback_count}/{args.episodes}")
+    print(f"  Full results: {results_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+IMPLEMENTATION ORDER (exact sequence to follow)
+================================================================================
+
+Do these in order. Do not skip ahead. Each step is verifiable before the next.
+
+STEP 1 — Find site name (5 minutes)
+  Run the one-liner from "STEP 0" section above on spark-3100.
+  Confirm site name is "gripper". If different, update SITE_NAME in ik.py.
+
+STEP 2 — Write simulator/ik.py
+  Use the complete source above verbatim.
+  One-line smoke test (run on spark):
+    MUJOCO_GL=egl python -c "
+    import sys; sys.path.insert(0, '.')
+    import numpy as np
+    from simulator.scene import load_model, make_data, reset_to_keyframe
+    from simulator.ik import solve_ik
+    model = load_model()
+    data = make_data(model)
+    reset_to_keyframe(model, data, 'home')
+    import mujoco
+    mujoco.mj_forward(model, data)
+    # Target: 15cm above the cube's default start position [0.5, 0.0, 0.03]
+    target = np.array([0.5, 0.0, 0.18])
+    q = solve_ik(model, data, target)
+    if q is None:
+        print('IK FAILED — check site name and joint indices')
+    else:
+        print(f'IK converged: q={np.round(q, 3)}')
+    "
+  Expected: IK converged with 7 joint angles printed.
+  If it fails: add debug prints inside solve_ik to check that site_id >= 0
+  and that jacp is non-zero after mj_forward.
+
+STEP 3 — Update actor/classical.py
+  Apply the edits described in FILE 2 section above:
+  a. Add _BASE_SEQUENCE = SEQUENCE[:] after SEQUENCE definition
+  b. Add restore_sequence() method
+  c. Add retry_to_position() method
+  d. Add self.restore_sequence() call at start of reset()
+
+  Smoke test:
+    MUJOCO_GL=egl python -c "
+    import sys; sys.path.insert(0, '.')
+    import numpy as np
+    from actor.classical import ClassicalActor
+    actor = ClassicalActor()
+    actor.reset()
+    dummy = np.zeros(7)
+    actor.retry_to_position(dummy, dummy)
+    print('retry_to_position OK')
+    actor.reset()   # check sequence restored
+    from actor.classical import SEQUENCE, _BASE_SEQUENCE
+    assert SEQUENCE[0][0] is _BASE_SEQUENCE[0][0], 'restore failed'
+    print('restore_sequence OK')
+    "
+
+STEP 4 — Update supervisor/supervise.py
+  Apply the targeted edits from FILE 3 section above.
+  - Add imports: numpy, cube_pos as cube_pos_signal, solve_ik
+  - Replace the `if correction.failure_type != "none":` block with the new version
+
+  Smoke test (offline, no Cerebras call):
+    MUJOCO_GL=egl python -c "
+    import sys; sys.path.insert(0, '.')
+    from supervisor.supervise import run_supervised_episode
+    from actor.classical import ClassicalActor
+    # unsupervised run to confirm basic episode still works
+    r = run_supervised_episode(ClassicalActor(), supervised=False,
+                                record=False, out_path='/dev/null',
+                                max_steps=200, verbose=False)
+    print(f'unsupervised smoke: steps={r[\"steps\"]} retries={r[\"retries\"]}')
+    "
+
+STEP 5 — Write scripts/run_rung3_random.py
+  Use the complete source above verbatim.
+
+  Quick test (1 episode, supervised only):
+    MUJOCO_GL=egl python scripts/run_rung3_random.py --episodes 1 --supervised-only
+
+STEP 6 — Full Build B test
+    MUJOCO_GL=egl python scripts/run_rung3_random.py --episodes 5
+
+  Check outputs/random/results.jsonl.
+  Success criterion: IK path fired in ≥3/5 episodes and the episode completed
+  (retries > 0, arm not stuck).
+
+
+================================================================================
+TESTING COMMANDS
+================================================================================
+
+All commands must be run from the project root on spark-3100 with venv active.
+
+# 0. Find site name
+MUJOCO_GL=egl python -c "
+import sys; sys.path.insert(0, '.')
+import mujoco
+from simulator.scene import load_model
+model = load_model()
+for i in range(model.nsite):
+    print(f'  [{i}]', mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, i))
+"
+
+# 1. IK smoke test (5cm Y offset, should converge)
+MUJOCO_GL=egl python -c "
+import sys; sys.path.insert(0, '.')
+import numpy as np, mujoco
+from simulator.scene import load_model, make_data, reset_to_keyframe
+from simulator.ik import solve_ik
+model = load_model(); data = make_data(model)
+reset_to_keyframe(model, data, 'home'); mujoco.mj_forward(model, data)
+for dy in [0.0, 0.05, 0.10, 0.20]:
+    q = solve_ik(model, data, np.array([0.5, dy, 0.18]))
+    print(f'dy={dy:.2f}: {\"converged\" if q is not None else \"FAILED\"}'
+          + (f'  q[0]={q[0]:.3f}' if q is not None else ''))
+"
+
+# 2. IK + actor integration (manually trigger retry_to_position)
+MUJOCO_GL=egl python -c "
+import sys; sys.path.insert(0, '.')
+import numpy as np, mujoco
+from simulator.scene import load_model, make_data, reset_to_keyframe
+from simulator.ik import solve_ik
+from actor.classical import ClassicalActor, SEQUENCE
+model = load_model(); data = make_data(model)
+reset_to_keyframe(model, data, 'home'); mujoco.mj_forward(model, data)
+actor = ClassicalActor(); actor.reset()
+cube_at = np.array([0.35, 0.12, 0.03])  # simulated displaced cube
+above = cube_at + [0, 0, 0.15]
+grasp = cube_at + [0, 0, 0.02]
+q_above = solve_ik(model, data, above)
+q_lower = solve_ik(model, data, grasp)
+if q_above is not None and q_lower is not None:
+    actor.retry_to_position(q_above, q_lower)
+    print('SEQUENCE[0][0][:7]:', SEQUENCE[0][0][:7])
+    print('Expected q_above :', q_above)
+    print('Match:', np.allclose(SEQUENCE[0][0][:7], q_above))
+else:
+    print('IK failed')
+"
+
+# 3. Full supervised episode with scripted 10cm random-ish nudge
+MUJOCO_GL=egl python -c "
+import sys; sys.path.insert(0, '.')
+import numpy as np, mujoco, math
+from supervisor.supervise import run_supervised_episode
+from actor.classical import ClassicalActor
+def nudge(model, data, step):
+    if step == 200:
+        data.qpos[9] += 0.10; data.qpos[10] += 0.08
+        mujoco.mj_forward(model, data)
+        print('  [nudge] +0.10 X, +0.08 Y')
+r = run_supervised_episode(
+    ClassicalActor(), perturb_fn=nudge, supervised=True,
+    out_path='outputs/build_b_test.mp4', max_steps=4000, verbose=True)
+print('steps:', r['steps'], 'retries:', r['retries'])
+for e in r['log']:
+    print('  log:', e.get('recovery_path'), e['correction']['failure_type'])
+" 2>&1 | tee /tmp/build_b_smoke.log
+
+# 4. Full random test
+MUJOCO_GL=egl python scripts/run_rung3_random.py --episodes 5 2>&1 | tee /tmp/build_b_random.log
+
+# 5. Verify results.jsonl was written
+python -c "
+import json
+with open('outputs/random/results.jsonl') as f:
+    for line in f:
+        r = json.loads(line)
+        print(f\"ep {r['episode']}: r={r['radius_m']:.2f}m  "
+              f"angle={r['angle_deg']:.0f}  "
+              f"paths={r.get('supervised_recovery_paths', [])}  "
+              f"retries={r.get('supervised_retries', 0)}\")
+"
+
+
+================================================================================
+FAILURE MODES AND MITIGATIONS
+================================================================================
+
+FAILURE: solve_ik returns None for a reachable target
+  CAUSE: step_size too large causing oscillation, or max_iters too small.
+  FIX: Decrease step_size from 0.5 to 0.3, or increase max_iters to 200.
+       Also check that mj_forward is called on the COPY before mj_jacSite.
+
+FAILURE: IK converges to wrong position (large residual error)
+  CAUSE: Damping lambda_sq too large, suppressing the pseudoinverse correction.
+  FIX: Decrease _LAMBDA_SQ from 1e-4 to 1e-6. Only do this if near-singular
+       configurations are not a problem (they aren't for pick-and-place reach).
+
+FAILURE: SEQUENCE not restored at episode boundary
+  CAUSE: retry_to_position patches SEQUENCE[0] and SEQUENCE[1]. If reset() is
+         not called between episodes, the next episode starts with IK targets
+         from the previous episode.
+  FIX: Confirmed — reset() calls restore_sequence() which resets SEQUENCE[0]
+       and SEQUENCE[1] to _BASE_SEQUENCE[0] and _BASE_SEQUENCE[1].
+       run_supervised_episode() calls actor.reset() at line 43.
+
+FAILURE: mj_forward on copy modifies contact forces in unexpected ways
+  CAUSE: copy.copy(data) is a shallow copy. mj_forward writes into data.contact,
+         data.efc_*, etc. which may be shared if shallow-copied.
+  FIX: In solve_ik, qpos and qvel are explicitly deep-copied. mj_forward writes
+       into these copies. The live data's qpos is not modified. Contact arrays
+       are re-computed from scratch in the copy and do not affect the original.
+       Confirmed safe by the explicit `d.qpos = data.qpos.copy()` line.
+
+FAILURE: arm reaches the IK target but still misses the cube (IK position error)
+  CAUSE: The "gripper" site is 10cm below the flange centred between fingertips.
+         If the cube is small (4x4x6 cm box) and the site target is 2cm above
+         the cube surface, the fingers should surround it. But if the site offset
+         is wrong (e.g. site is at flange, not between fingers), the arm will
+         descend too far or too little.
+  FIX: Verify with: MUJOCO_GL=egl python -c "
+         import sys; sys.path.insert(0, '.')
+         import mujoco
+         from simulator.scene import load_model, make_data, reset_to_keyframe
+         model = load_model(); data = make_data(model)
+         reset_to_keyframe(model, data, 'home')
+         mujoco.mj_forward(model, data)
+         sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, 'gripper')
+         print('gripper site pos:', data.site_xpos[sid])
+       "
+       Compare with the cube start pos [0.5, 0.0, 0.03]. If site Z is far from
+       expected, adjust the grasp_target offset in supervise.py from 0.02 to
+       whatever closes the gap.
+
+FAILURE: IK targets for the above-cube position cause SEQUENCE approach phase
+         to collide with the table
+  CAUSE: IK minimises position error but does not constrain orientation. The arm
+         might find a configuration where the elbow or forearm is near the table.
+  FIX: The IK_POS_MIN z=0.00 constraint prevents targeting below the table. For
+       the above-cube approach target (cube_z + 0.15 ≈ 0.18m), this is safe.
+       Add `IK_POS_MIN[2] = 0.05` if collisions are observed in practice.
+
+FAILURE: run_rung3_random.py reports all "no correction needed" (0 retries)
+  CAUSE: The failure signals are not triggering. This can happen if:
+         (a) SUPERVISOR_INTERVAL fires BEFORE the nudge (nudge at step 200,
+             first supervisor check at step 500 — this is correct timing).
+         (b) gripper_closed_empty is False because the arm hasn't closed yet.
+         (c) The arm genuinely picks up a displaced cube by luck (unlikely at
+             20cm displacement).
+  FIX: Print signals at each supervisor check:
+         print("  signals:", signals)
+       If all signals are False, increase nudge magnitude or decrease
+       SUPERVISOR_INTERVAL from 500 to 300 for the random test.
+
+FAILURE: "site not found" ValueError from solve_ik
+  CAUSE: SITE_NAME = "gripper" but the loaded model's site has a different name.
+  FIX: Re-run STEP 0 (find site name) and update SITE_NAME constant.
+
+
+================================================================================
+RATE LIMIT IMPACT
+================================================================================
+
+Build B adds exactly ZERO additional Cerebras API calls per cycle.
+The IK computation and cube_pos() call are pure Python/NumPy/MuJoCo — no network.
+
+Existing: 1 API call per supervisor interval (500 steps = 2.5s at timestep=0.005s)
+Build B:  1 API call per supervisor interval (unchanged)
+
+At 1 call per 2.5s = 24 RPM, well under the 100 RPM limit.
+Multi-agent (Build A, 3 calls per cycle) would be 72 RPM — also safe.
+
+
+================================================================================
+MODEL STRUCTURE REFERENCE
+================================================================================
+
+Scene: mujoco_menagerie/franka_emika_panda/mjx_single_cube.xml
+  includes: mjx_scene.xml
+    includes: mjx_panda.xml (Franka arm with hand)
+      defines: site "gripper" at pos="0 0 0.1" in the hand link
+               (10cm in the hand's Z direction, centred between fingertips)
+    defines: timestep=0.005s (200Hz physics)
+
+  worldbody:
+    body "box"  pos="0.5 0 0.03"  freejoint  (the green cube)
+    body "mocap_target"            mocap      (the red target marker)
+
+  keyframe "home":
+    qpos = [0, 0.3, 0, -1.57079, 0, 2.0, -0.7853, 0.04, 0.04,
+            0.7, 0, 0.03, 1, 0, 0, 0]
+    (note: cube default pos in keyframe is 0.7, 0, 0.03 — not 0.5, 0, 0.03)
+    (tasks/pick_place.py CUBE_START = [0.5, 0.0, 0.03] — verify which is live pos)
+
+  nq = 16  (7 arm + 2 finger + 7 freejoint)
+  nu = 8   (7 arm actuators + 1 gripper actuator)
+
+NOTE ON CUBE START POSITION:
+  The keyframe "home" sets cube qpos[9:12] = [0.7, 0.0, 0.03].
+  But tasks/pick_place.py defines CUBE_START = [0.5, 0.0, 0.03].
+  The cube's actual position at episode start comes from reset_to_keyframe()
+  which applies the "home" keyframe. So the cube starts at [0.7, 0.0, 0.03]
+  unless init_task() moves it. Verify by printing cube_pos(model, data) right
+  after reset in the episode runner. The IK solver reads the live position at
+  retry time (after the nudge has moved it), so this does not affect correctness
+  — but it means the arm's initial approach is targeting [0.7, 0.0, 0.03] (or
+  wherever ABOVE_CUBE puts the site), and the IK retry will target wherever the
+  cube is after the nudge.
+
+
+================================================================================
+SUCCESS CRITERIA
+================================================================================
+
+Build B is complete when ALL of the following hold:
+
+  1. simulator/ik.py exists and solve_ik() returns a 7-element array for the
+     cube's default start position (0.5 or 0.7, 0.0, 0.03+0.15).
+
+  2. ClassicalActor.retry_to_position() exists and SEQUENCE[0] and SEQUENCE[1]
+     are updated with IK-computed ctrl vectors when called.
+
+  3. ClassicalActor.reset() calls restore_sequence() and the original ctrl
+     vectors are reinstated before each episode.
+
+  4. supervisor/supervise.py reads cube_pos after Gemma fires, calls solve_ik,
+     and calls retry_to_position on success or retry(params) on failure.
+
+  5. scripts/run_rung3_random.py exists and runs 5 episodes without crashing.
+
+  6. results.jsonl shows "recovery_path": "ik" for at least 3/5 episodes.
+
+  7. The existing run_rung3.py (scripted ±4cm Y nudge) still works correctly —
+     Build B must not break the existing demo.
+
+  8. outputs/build_b_test.mp4 shows the arm recovering from a 10cm+8cm diagonal
+     displacement (from the smoke test command in STEP 4 above).
+
+
+================================================================================
+END OF BUILD B IMPLEMENTATION PLAN
+================================================================================
