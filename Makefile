@@ -33,6 +33,11 @@ episode: push
 	tailscale ssh $(SPARK) \
 		"cd $(SPARK_DIR) && source $(SPARK_VENV) && MUJOCO_GL=egl python scripts/run_episode.py"
 
+# push + run rung 3 (perturbed unsupervised + supervised side-by-side)
+rung3: push
+	tailscale ssh $(SPARK) \
+		"cd $(SPARK_DIR) && source $(SPARK_VENV) && MUJOCO_GL=egl python scripts/run_rung3.py"
+
 # serve outputs over HTTP from spark — open http://spark-3100:PORT in browser
 serve:
 	@echo "open http://spark-3100:$(PORT)/"
