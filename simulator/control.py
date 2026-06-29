@@ -1,8 +1,8 @@
 """
 Episode runner: drives actor through a task, optionally recording frames.
+Pass watch=True to stream live to http://spark-3100:8080 via mjviser.
 """
 import mujoco
-import numpy as np
 from pathlib import Path
 
 from simulator.scene import load_model, make_data, reset_to_keyframe
@@ -18,6 +18,8 @@ def run_episode(
     out_path: str = "outputs/episode.mp4",
     fps: int = 30,
     verbose: bool = True,
+    watch: bool = False,
+    watch_port: int = 8080,
 ) -> dict:
     model = load_model()
     data = make_data(model)
@@ -27,6 +29,19 @@ def run_episode(
         task_init_fn(model, data)
 
     actor.reset()
+
+    # optional live viewer
+    viser_scene = None
+    if watch:
+        try:
+            import viser
+            import mjviser
+            _server = viser.ViserServer(port=watch_port)
+            viser_scene = mjviser.ViserMujocoScene(_server, model, num_envs=1)
+            print(f"  live view → http://spark-3100:{watch_port}")
+        except Exception as e:
+            print(f"  watch mode unavailable: {e}")
+            viser_scene = None
 
     frames = []
     last_phase = None
@@ -40,6 +55,9 @@ def run_episode(
             if record and step % record_every == 0:
                 frames.append(render_frame(model, data, renderer))
 
+            if viser_scene is not None and step % 4 == 0:
+                viser_scene.update_from_mjdata(data)
+
             if verbose and actor.phase_name != last_phase:
                 last_phase = actor.phase_name
                 print(f"  step {step:4d}  phase: {last_phase}")
@@ -47,7 +65,6 @@ def run_episode(
             if actor.done():
                 break
 
-        # capture final frame
         if record:
             frames.append(render_frame(model, data, renderer))
 
