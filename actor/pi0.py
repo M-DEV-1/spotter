@@ -130,12 +130,20 @@ class Pi0Actor:
             / 255.0
         )                                                               # (1, 3, H, W)
 
-        # Observation dict key names from lerobot pi0_libero config.
-        # Image key and state dim need verification on spark when pi0 is unblocked.
+        import torch.nn.functional as F  # noqa: PLC0415
+        img_256 = F.interpolate(img_t, size=(256, 256), mode="bilinear", align_corners=False)
+        img_224 = F.interpolate(img_t, size=(224, 224), mode="bilinear", align_corners=False)
+
+        # Keys confirmed from PI0Policy.config.input_features on spark:
+        #   observation.images.image  (3,256,256)
+        #   observation.images.image2 (3,256,256)
+        #   observation.images.empty_camera_0 (3,224,224) — filled with zeros
         obs_dict = {
-            "observation.state": state_t,           # (1, 8) joint positions
-            "observation.images.top": img_t,        # (1, 3, H, W) top-down camera
-            "task": [self._instruction],             # list[str] — language conditioning
+            "observation.state": state_t,
+            "observation.images.image": img_256,
+            "observation.images.image2": img_256,
+            "observation.images.empty_camera_0": torch.zeros_like(img_224),
+            "task": [self._instruction],
         }
 
         with torch.no_grad():
@@ -190,9 +198,30 @@ class Pi0Actor:
             ) from exc
 
         import torch  # noqa: PLC0415
+        from safetensors.torch import load_file  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         policy = PI0Policy.from_pretrained(model_id)
+
+        # The checkpoint was saved with vision_tower.vision_model.X but the dev
+        # lerobot architecture expects vision_tower.X — remap those keys.
+        ckpt_path = Path(model_id) / "model.safetensors"
+        if ckpt_path.exists():
+            state_dict = load_file(str(ckpt_path), device="cpu")
+            remapped = {}
+            for k, v in state_dict.items():
+                new_k = k.replace(
+                    "vision_tower.vision_model.", "vision_tower."
+                )
+                remapped[new_k] = v
+            missing, unexpected = policy.load_state_dict(remapped, strict=False)
+            vt_missing = [k for k in missing if "vision_tower" in k]
+            if not vt_missing:
+                print("  pi0 weights loaded (vision tower key remap applied)")
+            else:
+                print(f"  pi0 WARNING: {len(vt_missing)} vision tower keys still missing")
+
         policy.eval()
         policy = policy.to(device)
         return policy
