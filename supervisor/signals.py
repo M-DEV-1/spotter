@@ -11,7 +11,7 @@ WORKSPACE_XY_MAX = np.array([ 1.2,  0.8])
 FLOOR_Z = 0.01   # below this = on the floor
 
 
-def _cube_pos(model, data) -> np.ndarray:
+def cube_pos(model, data) -> np.ndarray:
     bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "box")
     return data.xpos[bid].copy()
 
@@ -21,12 +21,12 @@ def gripper_closed_empty(model, data) -> bool:
     gripper_closed = data.ctrl[7] < 0.01
     if not gripper_closed:
         return False
-    return _cube_pos(model, data)[2] < FLOOR_Z + 0.04
+    return cube_pos(model, data)[2] < FLOOR_Z + 0.04
 
 
 def cube_out_of_region(model, data) -> bool:
     """Cube has left the reachable XY workspace or fallen below the floor."""
-    pos = _cube_pos(model, data)
+    pos = cube_pos(model, data)
     in_xy = np.all(pos[:2] >= WORKSPACE_XY_MIN) and np.all(pos[:2] <= WORKSPACE_XY_MAX)
     return not in_xy or pos[2] < -0.05
 
@@ -43,7 +43,7 @@ class NoProgressTracker:
         self._stale = 0
 
     def update(self, model, data) -> bool:
-        xy = _cube_pos(model, data)[:2].copy()
+        xy = cube_pos(model, data)[:2].copy()
         if self._last_xy is not None:
             if np.linalg.norm(xy - self._last_xy) < 0.001:
                 self._stale += 1
