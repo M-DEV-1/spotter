@@ -21,8 +21,9 @@ from tasks.pick_place import init_task
 
 load_dotenv()
 
-# Interval check for no_progress / cube_out_of_region (not for gripper_missed)
-INTERVAL_CHECK = 2000
+# Interval check for no_progress / cube_out_of_region.
+# For VLA actors we also check gripper_closed_empty here (no phase transitions).
+INTERVAL_CHECK = 500
 MAX_RETRIES = 3
 
 
@@ -180,14 +181,16 @@ def run_supervised_episode(
                     retries = _fire_supervisor(frame_now, signals, step, client, log, retries, actor, model, data)
                     prev_phase = None   # reset so next grasp→lift re-arms correctly
 
-            # ── interval trigger: cube_out_of_region / no_progress only ───
+            # ── interval trigger: cube_out_of_region / no_progress / gripper_empty ──
             elif (supervised
                     and step > 0
                     and step % INTERVAL_CHECK == 0
                     and retries < MAX_RETRIES):
                 no_prog = progress.update(model, data)
                 signals = compute_signals(model, data, no_progress=no_prog)
-                if signals.get("cube_out_of_region") or signals.get("no_progress"):
+                # VLA actors have no phase transitions so we catch gripper_closed_empty here too
+                vla_missed = is_vla and signals.get("gripper_closed_empty")
+                if signals.get("cube_out_of_region") or signals.get("no_progress") or vla_missed:
                     frame_now = render_frame(model, data, renderer)
                     retries = _fire_supervisor(frame_now, signals, step, client, log, retries, actor, model, data)
 
