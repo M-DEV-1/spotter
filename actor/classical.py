@@ -56,6 +56,12 @@ class ClassicalActor:
     def done(self) -> bool:
         return self._phase >= len(SEQUENCE)
 
+    def retry(self) -> None:
+        """Restart from approach, lerping smoothly from current arm position."""
+        self._phase = 0
+        self._phase_step = 0
+        # _prev stays as current ctrl so lerp is continuous
+
     @property
     def phase_name(self) -> str:
         if self._phase >= len(SEQUENCE):
