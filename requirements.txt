@@ -1,0 +1,9 @@
+# torch 2.11.0+cu130 installed separately (ARM64 CUDA wheel)
+mujoco==3.10.0
+robot-descriptions==2.0.0
+cerebras-cloud-sdk==1.67.0
+numpy==2.2.6
+imageio==2.37.3
+imageio-ffmpeg==0.6.0
+lerobot==0.5.2
+python-dotenv==1.0.0

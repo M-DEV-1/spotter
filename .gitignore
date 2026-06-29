@@ -1,0 +1,31 @@
+# env
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# external asset repos (clone separately)
+mujoco_menagerie/
+
+# outputs (gitignored — large binary artifacts)
+outputs/
+videos/
+*.mp4
+*.png
+*.jpg
+
+# docs (ignored for now, except project rules)
+*.md
+!CLAUDE.md
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
