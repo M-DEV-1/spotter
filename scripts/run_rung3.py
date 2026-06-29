@@ -88,3 +88,17 @@ r2 = run_supervised_episode(
 print(f"supervised done — {r2['steps']} steps, {r2['retries']} retries")
 for entry in r2["log"]:
     print(f"  step {entry['step']}: {entry['correction']['failure_type']} — {entry['correction']['corrected_instruction']}")
+
+# save log for web demo export
+import json
+log_path = str(prefix) + "_log.json"
+with open(log_path, "w") as f:
+    json.dump({
+        "unsupervised_mp4": str(prefix) + "_unsupervised.mp4",
+        "supervised_mp4": str(prefix) + "_supervised.mp4",
+        "unsupervised_steps": r1["steps"],
+        "supervised_steps": r2["steps"],
+        "retries": r2["retries"],
+        "supervisor_log": r2["log"],
+    }, f, indent=2)
+print(f"log → {log_path}")
