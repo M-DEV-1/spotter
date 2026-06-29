@@ -20,9 +20,8 @@ videos/
 *.png
 *.jpg
 
-# docs (ignored for now, except project rules)
+# docs (ignored for now)
 *.md
-!CLAUDE.md
 
 # editor / OS
 .DS_Store
