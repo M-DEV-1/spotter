@@ -3,8 +3,8 @@ Classical keyframe-sequencing actor for Franka Panda pick-and-place.
 Ctrl vectors are hand-tuned via scripts/tune_poses.py (mjviser web viewer).
 
 Two retry paths:
-  retry(params)                 — Gemma-direction path (j1/depth offset from parse_correction)
-  retry_to_position(above, low) — IK path (exact joint targets from simulator/ik.py)
+  retry(params)                  — Gemma-direction path (j1/depth offset from parse_correction)
+  retry_to_position(above, low)  — IK path (exact joint targets from simulator/ik.py)
 """
 import numpy as np
 
@@ -28,7 +28,11 @@ SEQUENCE = [
     (HOME,       200, "return"),
 ]
 
-# phases that aim at the cube — joint1 offset applied here
+# Snapshot of the original approach/lower entries so restore_sequence() can reset them
+# after retry_to_position() patches SEQUENCE[0] and SEQUENCE[1] during an episode.
+_BASE_SEQUENCE = SEQUENCE[:]
+
+# phases that aim at the cube — direction-offset path applies here
 _GRASP_PHASES = {"approach", "lower", "grasp"}
 
 
@@ -38,6 +42,7 @@ def _lerp(a, b, t):
 
 class ClassicalActor:
     def reset(self):
+        self.restore_sequence()   # undo any SEQUENCE patches from a previous episode
         self._phase = 0
         self._phase_step = 0
         self._prev = HOME.copy()
@@ -46,13 +51,25 @@ class ClassicalActor:
         self._ik_above = None     # IK path: exact joint targets from simulator/ik.py
         self._ik_lower = None     # IK path: exact joint targets from simulator/ik.py
 
+    def restore_sequence(self) -> None:
+        """Restore SEQUENCE[0] and SEQUENCE[1] to the original hand-tuned vectors."""
+        SEQUENCE[0] = _BASE_SEQUENCE[0]
+        SEQUENCE[1] = _BASE_SEQUENCE[1]
+
     def act(self, obs=None) -> np.ndarray:
         if self._phase >= len(SEQUENCE):
             return HOME.copy()
 
         target_raw, duration, name = SEQUENCE[self._phase]
 
-        if name in _GRASP_PHASES and (self._j1_offset != 0.0 or self._depth_offset != 0.0):
+        # IK path: use solved joint targets for approach and lower phases
+        if self._ik_above is not None and name == "approach":
+            target = np.concatenate([self._ik_above, [0.04]])  # gripper open
+        elif self._ik_lower is not None and name in ("lower", "grasp"):
+            gripper = 0.04 if name == "lower" else 0.00
+            target = np.concatenate([self._ik_lower, [gripper]])
+        # Direction-offset path
+        elif name in _GRASP_PHASES and (self._j1_offset != 0.0 or self._depth_offset != 0.0):
             target = target_raw.copy()
             target[0] += self._j1_offset
             if name == "lower":
@@ -101,41 +118,6 @@ class ClassicalActor:
         self._depth_offset = 0.0
         self._phase = 0
         self._phase_step = 0
-
-    def act(self, obs=None) -> np.ndarray:
-        if self._phase >= len(SEQUENCE):
-            return HOME.copy()
-
-        target_raw, duration, name = SEQUENCE[self._phase]
-
-        # IK path: use solved joint targets for approach and lower phases
-        if self._ik_above is not None and name == "approach":
-            target = np.concatenate([self._ik_above, [0.04]])  # gripper open
-        elif self._ik_lower is not None and name in ("lower", "grasp"):
-            gripper = 0.04 if name == "lower" else 0.00
-            target = np.concatenate([self._ik_lower, [gripper]])
-        # Direction-offset path
-        elif name in _GRASP_PHASES and (self._j1_offset != 0.0 or self._depth_offset != 0.0):
-            target = target_raw.copy()
-            target[0] += self._j1_offset
-            if name == "lower":
-                target[1] = np.clip(target[1] + self._depth_offset, 0.6, 1.1)
-        else:
-            target = target_raw
-
-        t = self._phase_step / max(duration, 1)
-        ctrl = _lerp(self._prev, target, t)
-
-        self._phase_step += 1
-        if self._phase_step >= duration:
-            self._prev = target.copy()
-            self._phase += 1
-            self._phase_step = 0
-
-        return ctrl
-
-    def done(self) -> bool:
-        return self._phase >= len(SEQUENCE)
 
     @property
     def phase_name(self) -> str:
