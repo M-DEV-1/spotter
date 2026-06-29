@@ -2,7 +2,9 @@
 
 **Frozen robot policy does pick-and-place in MuJoCo; Gemma 4 31B on Cerebras watches for failures and issues corrective instructions in a live loop.**
 
-Hackathon project -- Cerebras x Google DeepMind Gemma 4 Hackathon, 2025. Solo, 24h.
+![Franka arm reaching for the green cube](docs/demo_frame.png)
+
+Hackathon project -- Cerebras x Google DeepMind Gemma 4 Hackathon, 2026. Solo, 24h.
 
 ---
 

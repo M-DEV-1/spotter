@@ -17,8 +17,10 @@ mujoco_menagerie/
 outputs/
 videos/
 *.mp4
-*.png
+# images except docs/
 *.jpg
+[^d]*.png
+outputs/**/*.png
 
 # docs (except README)
 PLAN.md

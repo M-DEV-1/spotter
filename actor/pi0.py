@@ -201,10 +201,15 @@ class Pi0Actor:
             ctrl[7] = 0.04
 
         self._cached_ctrl = ctrl
+        recompute_n = self._step // _DECIMATION
         self._step += 1
-        if self._step % (_DECIMATION * 10) == 0:  # every ~10 recomputes
-            print(f"    [pi0] step={self._step} action_raw[6]={action_norm[6]:.3f} "
-                  f"action_real[6]={action_real[6]:.3f} -> g={ctrl[7]:.3f}")
+        if recompute_n % 5 == 0:  # print every 5th recompute
+            import mujoco as _mj  # noqa: PLC0415
+            sid = _mj.mj_name2id(self._mj_model, _mj.mjtObj.mjOBJ_SITE, "gripper")
+            ee_z = self._mj_data.site_xpos[sid][2] if sid >= 0 else float("nan")
+            print(f"    [pi0] recompute={recompute_n} "
+                  f"dx6={np.round(action_real[:6],4).tolist()} "
+                  f"grip_raw={action_real[6]:.3f} -> g={ctrl[7]:.3f} ee_z={ee_z:.3f}")
         return ctrl
 
     def done(self) -> bool:
