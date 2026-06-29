@@ -5,12 +5,22 @@ import mujoco
 import numpy as np
 
 
+def _default_camera() -> mujoco.MjvCamera:
+    cam = mujoco.MjvCamera()
+    cam.lookat = np.array([0.5, 0.1, 0.15])
+    cam.distance = 1.6
+    cam.azimuth = 145   # front-left view
+    cam.elevation = -22
+    return cam
+
+
 def make_renderer(model, height: int = 480, width: int = 640) -> mujoco.Renderer:
     return mujoco.Renderer(model, height, width)
 
 
-def render_frame(model, data, renderer) -> np.ndarray:
-    renderer.update_scene(data)
+def render_frame(model, data, renderer, camera=None) -> np.ndarray:
+    cam = camera if camera is not None else _default_camera()
+    renderer.update_scene(data, camera=cam)
     return renderer.render()
 
 
